@@ -1,0 +1,84 @@
+# serializer version: 1
+# name: test_spec[router spec]
+  dict({
+    'info': dict({
+      'title': 'Test API',
+      'version': '1.2.3',
+    }),
+    'openapi': '3.0.0',
+    'paths': dict({
+      '/hello/{name}': dict({
+        'get': dict({
+          'parameters': list([
+            dict({
+              'in': 'path',
+              'name': 'name',
+              'required': True,
+              'schema': dict({
+                'type': 'string',
+              }),
+            }),
+          ]),
+          'responses': dict({
+            '200': dict({
+              'description': 'OK',
+            }),
+          }),
+        }),
+      }),
+      '/test': dict({
+        'post': dict({
+          'parameters': list([
+          ]),
+          'requestBody': dict({
+            'content': dict({
+              'application/json': dict({
+                'schema': dict({
+                  'properties': dict({
+                    'id': dict({
+                      'title': 'Id',
+                      'type': 'integer',
+                    }),
+                  }),
+                  'required': list([
+                    'id',
+                  ]),
+                  'title': 'Input',
+                  'type': 'object',
+                }),
+              }),
+            }),
+            'required': True,
+          }),
+          'responses': dict({
+            '200': dict({
+              'content': dict({
+                'application/json': dict({
+                  'schema': dict({
+                    'properties': dict({
+                      'id_negative': dict({
+                        'title': 'Id Negative',
+                        'type': 'integer',
+                      }),
+                    }),
+                    'required': list([
+                      'id_negative',
+                    ]),
+                    'title': 'Output',
+                    'type': 'object',
+                  }),
+                }),
+              }),
+              'description': 'OK',
+            }),
+          }),
+        }),
+      }),
+    }),
+    'servers': list([
+      dict({
+        'url': 'http://example.com',
+      }),
+    ]),
+  })
+# ---

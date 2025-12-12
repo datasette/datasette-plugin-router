@@ -1,0 +1,49 @@
+[project]
+name = "datasette-plugin-router"
+version = "0.1"
+description = "WIP router for Datasette plugins"
+readme = "README.md"
+authors = [{name = "Alex Garcia"}]
+license = "Apache-2.0"
+classifiers=[
+    "Framework :: Datasette"
+]
+requires-python = ">=3.10"
+dependencies = [
+    "datasette>=1a23",
+    "pydantic>=2.12.5",
+    "python-openapi>=0.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "syrupy>=5.0.0",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[project.urls]
+Homepage = "https://github.com/datasette/datasette-plugin-router"
+Changelog = "https://github.com/datasette/datasette-plugin-router/releases"
+Issues = "https://github.com/datasette/datasette-plugin-router/issues"
+CI = "https://github.com/datasette/datasette-plugin-router/actions"
+
+[project.entry-points.datasette]
+plugin_router = "datasette_plugin_router"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.setuptools.package-data]
+datasette_plugin_router = ["static/*", "templates/*"]
+
+[tool.setuptools.packages.find]
+exclude = [
+    "sample",
+]
