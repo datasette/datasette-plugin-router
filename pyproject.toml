@@ -1,6 +1,6 @@
 [project]
 name = "datasette-plugin-router"
-version = "0.1"
+version = "0.0.1a1"
 description = "WIP router for Datasette plugins"
 readme = "README.md"
 authors = [{name = "Alex Garcia"}]
