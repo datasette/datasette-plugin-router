@@ -3,6 +3,7 @@ import pytest
 from datasette_plugin_router import Router, Body
 from pydantic import BaseModel
 from datasette import hookimpl, Response
+from typing import List
 
 @pytest.mark.asyncio
 async def test_plugin_is_installed():
@@ -51,3 +52,43 @@ async def test_spec(snapshot):
 
     finally:
         datasette.pm.unregister(name="test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_nested_pydantic_models_openapi():
+    """Test that nested Pydantic models generate valid OpenAPI with components.schemas."""
+    
+    class DocumentListItem(BaseModel):
+        id: int
+        title: str
+    
+    class DocumentListOutput(BaseModel):
+        documents: List[DocumentListItem]
+        total: int
+
+    router = Router(title="Nested API", version="1.0.0", server_url="http://example.com")
+
+    @router.GET("/documents", output=DocumentListOutput)
+    async def list_documents():
+        return Response.json({"documents": [], "total": 0})
+    
+    spec = router.openapi_document_json()
+    
+    # Verify that $defs was extracted and moved to components.schemas
+    assert "components" in spec, "Should have components section"
+    assert "schemas" in spec["components"], "Should have schemas in components"
+    assert "DocumentListItem" in spec["components"]["schemas"], "Should have DocumentListItem in schemas"
+    
+    # Verify the nested model schema is correct
+    item_schema = spec["components"]["schemas"]["DocumentListItem"]
+    assert item_schema["type"] == "object"
+    assert "id" in item_schema["properties"]
+    assert "title" in item_schema["properties"]
+    
+    # Verify the response schema uses the correct $ref
+    response_schema = spec["paths"]["/documents"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert "$defs" not in response_schema, "Should not have $defs in inline schema"
+    
+    # Verify the $ref points to components/schemas
+    docs_property = response_schema["properties"]["documents"]
+    assert docs_property["items"]["$ref"] == "#/components/schemas/DocumentListItem"

@@ -139,6 +139,8 @@ class Router:
 
     def openapi_document_json(self) -> Dict[str, Any]:
         """Return a minimal OpenAPI 3 document as a Python dict."""
+        components_schemas: Dict[str, Any] = {}
+
         doc: Dict[str, Any] = {
             "openapi": "3.0.0",
             "info": {"title": self.title, "version": self.version},
@@ -159,13 +161,21 @@ class Router:
 
             # Use precomputed schemas stored on the Route entry
             if entry.input_schema is not None:
-                operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": entry.input_schema}}}
+                # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
+                processed_schema = _extract_defs_from_schema(entry.input_schema, components_schemas)
+                operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": processed_schema}}}
 
             if entry.output is not None:
                 schema = _model_to_schema(entry.output) or {"type": "object"}
-                operation["responses"]["200"]["content"] = {"application/json": {"schema": schema}}
+                # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
+                processed_schema = _extract_defs_from_schema(schema, components_schemas)
+                operation["responses"]["200"]["content"] = {"application/json": {"schema": processed_schema}}
 
             doc["paths"].setdefault(openapi_path, {})[method] = operation
+
+        # Add components.schemas if any $defs were extracted
+        if components_schemas:
+            doc["components"] = {"schemas": components_schemas}
 
         return doc
 
@@ -188,6 +198,50 @@ def _model_to_schema(model: type) -> Optional[Dict[str, Any]]:
     if isinstance(ann, dict):
         return {"type": "object", "properties": {k: {"type": "string"} for k in ann.keys()}}
     return None
+
+
+def _extract_defs_from_schema(schema: Dict[str, Any], components_schemas: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract $defs from a schema, add them to components_schemas, and rewrite $refs.
+
+    Pydantic's model_json_schema() generates JSON Schema 2020-12 style with $defs
+    for nested model references. OpenAPI 3.0 expects schemas under #/components/schemas/.
+    This function extracts $defs, moves them to components_schemas, and rewrites
+    $ref values from #/$defs/ModelName to #/components/schemas/ModelName.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    # Make a copy to avoid mutating the original
+    schema = dict(schema)
+
+    # Extract $defs and add to components_schemas
+    if "$defs" in schema:
+        defs = schema.pop("$defs")
+        for name, definition in defs.items():
+            # Recursively process nested $defs in definitions
+            processed_def = _rewrite_refs(definition)
+            components_schemas[name] = processed_def
+
+    # Rewrite $refs in the schema
+    return _rewrite_refs(schema)
+
+
+def _rewrite_refs(obj: Any) -> Any:
+    """Recursively rewrite $ref values from #/$defs/X to #/components/schemas/X."""
+    if isinstance(obj, dict):
+        result = {}
+        for key, value in obj.items():
+            if key == "$ref" and isinstance(value, str) and value.startswith("#/$defs/"):
+                # Rewrite the ref to point to components/schemas
+                model_name = value[len("#/$defs/"):]
+                result[key] = f"#/components/schemas/{model_name}"
+            else:
+                result[key] = _rewrite_refs(value)
+        return result
+    elif isinstance(obj, list):
+        return [_rewrite_refs(item) for item in obj]
+    else:
+        return obj
 
 
 def _extract_named_groups(regex: str) -> List[str]:
