@@ -3,7 +3,7 @@ import pytest
 from datasette_plugin_router import Router, Body
 from pydantic import BaseModel
 from datasette import hookimpl, Response
-from typing import List
+from typing import List, Annotated
 
 @pytest.mark.asyncio
 async def test_plugin_is_installed():
@@ -92,3 +92,66 @@ async def test_nested_pydantic_models_openapi():
     # Verify the $ref points to components/schemas
     docs_property = response_schema["properties"]["documents"]
     assert docs_property["items"]["$ref"] == "#/components/schemas/DocumentListItem"
+
+
+@pytest.mark.asyncio
+async def test_annotated_body_syntax():
+    """Test that Annotated[Model, Body()] syntax works for type-safe parameters."""
+    datasette = Datasette(memory=True)
+    
+    class Input(BaseModel):
+        id: int
+        name: str
+
+    class Output(BaseModel):
+        id_negative: int
+        name_upper: str
+
+    router = Router(title="Annotated API", version="1.0.0", server_url="http://example.com")
+
+    # Using Annotated[Model, Body()] for full type safety
+    @router.POST("/annotated-test", output=Output)
+    async def test_endpoint(params: Annotated[Input, Body()]):
+        # params is now properly typed as Input, not Body[Input]
+        # Type checkers understand params.id is int, params.name is str
+        return Response.json(Output(
+            id_negative=-1 * params.id,
+            name_upper=params.name.upper()
+        ).model_dump())
+    
+    class TestPlugin:
+        __name__ = "AnnotatedTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+    
+    try:
+        datasette.pm.register(TestPlugin(), name="annotated-test-plugin")
+
+        # Test the endpoint works correctly
+        result = await datasette.client.post("/annotated-test", json={"id": 42, "name": "hello"})
+        assert result.status_code == 200
+        assert result.json() == {"id_negative": -42, "name_upper": "HELLO"}
+        
+        # Verify OpenAPI spec is generated correctly
+        spec = router.openapi_document_json()
+        assert "/annotated-test" in spec["paths"]
+        post_spec = spec["paths"]["/annotated-test"]["post"]
+        
+        # Should have request body schema
+        assert "requestBody" in post_spec
+        assert post_spec["requestBody"]["required"] is True
+        request_schema = post_spec["requestBody"]["content"]["application/json"]["schema"]
+        assert "properties" in request_schema
+        assert "id" in request_schema["properties"]
+        assert "name" in request_schema["properties"]
+        
+        # Should have response schema
+        response_schema = post_spec["responses"]["200"]["content"]["application/json"]["schema"]
+        assert "properties" in response_schema
+        assert "id_negative" in response_schema["properties"]
+        assert "name_upper" in response_schema["properties"]
+
+    finally:
+        datasette.pm.unregister(name="annotated-test-plugin")

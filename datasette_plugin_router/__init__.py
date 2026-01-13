@@ -1,7 +1,7 @@
 from __future__ import annotations
 import inspect
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
 from dataclasses import dataclass
 
 
@@ -14,36 +14,38 @@ class Route:
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
 
-T = None
+T = TypeVar('T')
 
 
 class Body:
     """Marker for request body parameters.
 
     Usage:
-      async def view(params: Body[InputModel]):
-          # params is validated instance of InputModel
+      from typing import Annotated
+      
+      async def view(params: Annotated[InputModel, Body()]):
+          # params is properly typed as InputModel
+          # and at runtime, Body() marker tells router to parse request body
 
-    At runtime `Body[InputModel]` returns an instance of `Body` which
-    stores the model in `model`. This makes it friendly for static
-    checkers that forbid call expressions in type contexts (e.g.
-    `Body(Input)`), while keeping the existing runtime handling that
-    uses `isinstance(annotation, Body)`.
+    The recommended pattern is to use typing.Annotated for full type safety.
+    For backwards compatibility, Body[Model] syntax is still supported.
     """
 
-    def __init__(self, model: type[Any]):
+    def __init__(self, model: Optional[type[T]] = None):
         self.model = model
 
     def __repr__(self) -> str:  # helpful for debugging
-        try:
-            name = getattr(self.model, "__name__", repr(self.model))
-        except Exception:
-            name = repr(self.model)
-        return f"Body[{name}]"
+        if self.model:
+            try:
+                name = getattr(self.model, "__name__", repr(self.model))
+            except Exception:
+                name = repr(self.model)
+            return f"Body[{name}]"
+        return "Body()"
 
     @classmethod
-    def __class_getitem__(cls, item: Any) -> "Body":
-        """Allow writing `Body[Model]` in annotations.
+    def __class_getitem__(cls, item: type[T]) -> "Body":
+        """Allow writing `Body[Model]` in annotations (backwards compatibility).
 
         Python will call this at import-time for subscription expressions
         (PEP 560). We return an instance of `Body` so that runtime code
@@ -72,10 +74,22 @@ class Router:
             # we don't need to keep references to the original function
             entry = Route(path=path, output=output, method=method, fn=None)
             input_model = None
-            # inspect the handler's annotations for Body[...] parameters
+            # inspect the handler's annotations for Body[...] parameters or Annotated[..., Body()]
             try:
                 for _, param in inspect.signature(fn).parameters.items():
-                    if isinstance(param.annotation, Body):
+                    # Check for Annotated[Model, Body()] pattern
+                    if get_origin(param.annotation) is Annotated:
+                        args = get_args(param.annotation)
+                        if len(args) >= 2:
+                            # args[0] is the actual type, args[1:] are metadata
+                            for metadata in args[1:]:
+                                if isinstance(metadata, Body):
+                                    input_model = args[0]
+                                    break
+                        if input_model:
+                            break
+                    # Check for backwards-compatible Body[Model] pattern
+                    elif isinstance(param.annotation, Body):
                         input_model = param.annotation.model
                         break
             except Exception:
@@ -111,9 +125,22 @@ class Router:
                         kwargs["send"] = send
                         continue
                     
-                    if isinstance(param.annotation, Body):
+                    # Check for Annotated[Model, Body()] pattern
+                    body_model = None
+                    if get_origin(param.annotation) is Annotated:
+                        args = get_args(param.annotation)
+                        if len(args) >= 2:
+                            for metadata in args[1:]:
+                                if isinstance(metadata, Body):
+                                    body_model = args[0]
+                                    break
+                    # Check for backwards-compatible Body[Model] pattern
+                    elif isinstance(param.annotation, Body):
+                        body_model = param.annotation.model
+                    
+                    if body_model is not None:
                         data = await request.post_body()
-                        model_instance = param.annotation.model.model_validate_json(data)
+                        model_instance = body_model.model_validate_json(data)  # type: ignore[attr-defined]
                         kwargs[name] = model_instance
                         continue
                     
@@ -134,7 +161,8 @@ class Router:
         """Return a list of (regex, view_fn) tuples suitable for Datasette's register_routes."""
         out: List[Tuple[str, Callable]] = []
         for entry in self._routes:
-            out.append((entry.path, entry.fn))
+            if entry.fn is not None:
+                out.append((entry.path, entry.fn))
         return out
 
     def openapi_document_json(self) -> Dict[str, Any]:
@@ -185,13 +213,13 @@ def _model_to_schema(model: type) -> Optional[Dict[str, Any]]:
     mjs = getattr(model, "model_json_schema", None)
     if callable(mjs):
         try:
-            return mjs()
+            return mjs()  # type: ignore[no-any-return]
         except Exception:
             pass
     schema_fn = getattr(model, "schema", None)
     if callable(schema_fn):
         try:
-            return schema_fn()
+            return schema_fn()  # type: ignore[no-any-return]
         except Exception:
             pass
     ann = getattr(model, "__annotations__", None)

@@ -2,6 +2,7 @@ from datasette import Response, hookimpl
 from datasette_plugin_router import Router, Body
 from pydantic import BaseModel
 from pathlib import Path
+from typing import Annotated
 
 router = Router()
 
@@ -17,7 +18,9 @@ class Output(BaseModel):
 
 
 @router.POST(r"/-/demo1$", output=Output)
-async def demo1(params: Body[Input]) -> Output:
+async def demo1(params: Annotated[Input, Body()]):
+    # params is now properly typed as Input, not Body[Input]
+    # Type checkers will understand params.id is int, params.name is str
     output = Output(
         id_negative=-1 * params.id,
         name_upper=params.name.upper(),
