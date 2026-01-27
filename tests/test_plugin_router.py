@@ -27,7 +27,7 @@ async def test_spec(snapshot):
     router = Router(title="Test API", version="1.2.3", server_url="http://example.com")
 
     @router.POST("/test", output=Output)
-    async def test_endpoint(params: Body[Input]):
+    async def test_endpoint(params: Annotated[Input, Body()]):
         return Response.json(Output(id_negative=-1 * params.id).model_dump())
     
     @router.GET(r"/hello/(?P<name>.*)$")
