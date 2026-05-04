@@ -95,6 +95,46 @@ async def test_nested_pydantic_models_openapi():
 
 
 @pytest.mark.asyncio
+async def test_int_url_var_param():
+    """Test that int-annotated URL params are cast to int before being passed."""
+    datasette = Datasette(memory=True)
+
+    router = Router(title="Int API", version="1.0.0", server_url="http://example.com")
+
+    captured = {}
+
+    @router.GET(r"/items/(?P<item_id>\d+)$")
+    async def item(item_id: int):
+        captured["item_id"] = item_id
+        captured["type"] = type(item_id).__name__
+        return Response.json({"id": item_id, "type": type(item_id).__name__})
+
+    class TestPlugin:
+        __name__ = "IntUrlVarTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="int-url-var-test-plugin")
+
+        result = await datasette.client.get("/items/42")
+        assert result.status_code == 200
+        assert result.json() == {"id": 42, "type": "int"}
+        assert captured == {"item_id": 42, "type": "int"}
+
+        # Verify OpenAPI emits integer schema for int-annotated path params
+        spec = router.openapi_document_json()
+        params = spec["paths"]["/items/{item_id}"]["get"]["parameters"]
+        assert params == [
+            {"name": "item_id", "in": "path", "required": True, "schema": {"type": "integer"}}
+        ]
+    finally:
+        datasette.pm.unregister(name="int-url-var-test-plugin")
+
+
+@pytest.mark.asyncio
 async def test_annotated_body_syntax():
     """Test that Annotated[Model, Body()] syntax works for type-safe parameters."""
     datasette = Datasette(memory=True)

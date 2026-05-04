@@ -13,6 +13,9 @@ class Route:
     output: Optional[type]
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
+    # Map from URL-var name -> annotation type (e.g. str, int). Used by
+    # the OpenAPI emitter to type path parameters.
+    path_param_types: Optional[Dict[str, type]] = None
 
 T = TypeVar('T')
 
@@ -73,6 +76,17 @@ class Router:
             # create route entry and compute/store input/output schemas now so
             # we don't need to keep references to the original function
             entry = Route(path=path, output=output, method=method, fn=None)
+            # Capture annotation types for any URL-var path parameters so the
+            # OpenAPI emitter can pick the right schema type per param.
+            path_param_names = set(_extract_named_groups(path))
+            param_types: Dict[str, type] = {}
+            try:
+                for pname, pparam in inspect.signature(fn).parameters.items():
+                    if pname in path_param_names and isinstance(pparam.annotation, type):
+                        param_types[pname] = pparam.annotation
+            except Exception:
+                pass
+            entry.path_param_types = param_types
             input_model = None
             # inspect the handler's annotations for Body[...] parameters or Annotated[..., Body()]
             try:
@@ -148,6 +162,9 @@ class Router:
                     if param.annotation is str:
                         kwargs[name] = request.url_vars[name]
                         continue
+                    if param.annotation is int:
+                        kwargs[name] = int(request.url_vars[name])
+                        continue
 
                 return await fn(**kwargs)
 
@@ -182,8 +199,16 @@ class Router:
             method = entry.method.lower()
 
             parameters: List[Dict[str, Any]] = []
+            param_types = entry.path_param_types or {}
             for name in _extract_named_groups(path):
-                parameters.append({"name": name, "in": "path", "required": True, "schema": {"type": "string"}})
+                ann = param_types.get(name, str)
+                # bool is an int subclass; we don't support bool path params,
+                # so fall back to "string" for anything we don't recognize.
+                if ann is int:
+                    schema_type = "integer"
+                else:
+                    schema_type = "string"
+                parameters.append({"name": name, "in": "path", "required": True, "schema": {"type": schema_type}})
 
             operation: Dict[str, Any] = {"responses": {"200": {"description": "OK"}}, "parameters": parameters}
 
