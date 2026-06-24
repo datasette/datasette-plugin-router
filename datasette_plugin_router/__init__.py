@@ -4,6 +4,9 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
 from dataclasses import dataclass
 
+from datasette import Response
+from pydantic import ValidationError
+
 
 @dataclass
 class Route:
@@ -154,7 +157,10 @@ class Router:
                     
                     if body_model is not None:
                         data = await request.post_body()
-                        model_instance = body_model.model_validate_json(data)  # type: ignore[attr-defined]
+                        try:
+                            model_instance = body_model.model_validate_json(data)  # type: ignore[attr-defined]
+                        except ValidationError as exc:
+                            return _validation_error_response(exc)
                         kwargs[name] = model_instance
                         continue
                     
@@ -231,6 +237,19 @@ class Router:
             doc["components"] = {"schemas": components_schemas}
 
         return doc
+
+def _validation_error_response(exc: ValidationError) -> Response:
+    """Turn a Pydantic ValidationError into a 400 {"error": ..., "errors": [...]} response."""
+    # ctx can hold a non-serializable ValueError, so drop it (and url/input noise).
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    parts: List[str] = []
+    for err in errors:
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        msg = err.get("msg", "Invalid input")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    message = "; ".join(parts) if parts else "Invalid request body"
+    return Response.json({"error": message, "errors": errors}, status=400)
+
 
 def _model_to_schema(model: type) -> Optional[Dict[str, Any]]:
     if model is None:

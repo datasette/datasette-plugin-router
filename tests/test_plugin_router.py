@@ -3,6 +3,7 @@ import pytest
 from datasette_plugin_router import Router, Body
 from pydantic import BaseModel
 from datasette import hookimpl, Response
+from pydantic import field_validator
 from typing import List, Annotated
 
 @pytest.mark.asyncio
@@ -195,3 +196,78 @@ async def test_annotated_body_syntax():
 
     finally:
         datasette.pm.unregister(name="annotated-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_body_validation_returns_400():
+    """A bad Body() request body yields a 400 with {"error", "errors"}, not a 500."""
+    datasette = Datasette(memory=True)
+
+    class Input(BaseModel):
+        id: int
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def name_not_empty(cls, v):
+            if not v:
+                raise ValueError("name must not be empty")
+            return v
+
+    router = Router(title="Validation API", version="1.0.0", server_url="http://example.com")
+
+    @router.POST("/validate-test")
+    async def validate_endpoint(params: Annotated[Input, Body()]):
+        return Response.json({"id": params.id, "name": params.name})
+
+    class TestPlugin:
+        __name__ = "ValidationTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="validation-test-plugin")
+
+        # valid body is injected and the handler runs normally
+        ok = await datasette.client.post("/validate-test", json={"id": 1, "name": "x"})
+        assert ok.status_code == 200
+        assert ok.json() == {"id": 1, "name": "x"}
+
+        # wrong type
+        bad_type = await datasette.client.post(
+            "/validate-test", json={"id": "not-an-int", "name": "x"}
+        )
+        assert bad_type.status_code == 400
+        body = bad_type.json()
+        assert isinstance(body["error"], str)
+        assert body["errors"][0]["loc"] == ["id"]
+
+        # missing required field
+        missing = await datasette.client.post("/validate-test", json={"id": 1})
+        assert missing.status_code == 400
+        assert "name" in missing.json()["error"]
+
+        # custom validator message passes through verbatim
+        custom = await datasette.client.post("/validate-test", json={"id": 1, "name": ""})
+        assert custom.status_code == 400
+        assert "name must not be empty" in custom.json()["error"]
+
+        # empty body
+        empty = await datasette.client.post(
+            "/validate-test", content=b"", headers={"content-type": "application/json"}
+        )
+        assert empty.status_code == 400
+        assert "error" in empty.json()
+
+        # non-JSON body
+        non_json = await datasette.client.post(
+            "/validate-test", content=b"this is not json",
+            headers={"content-type": "application/json"},
+        )
+        assert non_json.status_code == 400
+        assert "error" in non_json.json()
+
+    finally:
+        datasette.pm.unregister(name="validation-test-plugin")
