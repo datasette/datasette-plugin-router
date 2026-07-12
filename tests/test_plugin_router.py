@@ -11,7 +11,10 @@ async def test_plugin_is_installed():
     datasette = Datasette(memory=True)
     response = await datasette.client.get("/-/plugins.json")
     assert response.status_code == 200
-    installed_plugins = {p["name"] for p in response.json()}
+    data = response.json()
+    # datasette >= 1.0a36 wraps the list in {"ok": ..., "plugins": [...]}
+    plugins = data["plugins"] if isinstance(data, dict) else data
+    installed_plugins = {p["name"] for p in plugins}
     assert "datasette-plugin-router" in installed_plugins
 
 
