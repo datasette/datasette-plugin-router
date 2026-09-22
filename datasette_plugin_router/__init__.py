@@ -107,6 +107,15 @@ class Router:
     def GET(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
         return self._add_route("get", path, output=output, permission=permission)
 
+    def PUT(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
+        return self._add_route("put", path, output=output, permission=permission)
+
+    def DELETE(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
+        return self._add_route("delete", path, output=output, permission=permission)
+
+    def PATCH(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
+        return self._add_route("patch", path, output=output, permission=permission)
+
     def _add_route(self, method: str, path: str, *, output: Optional[type], permission: Optional[str] = None):
         def decorator(fn: Callable):
             # create route entry and compute/store input/output schemas now so

@@ -700,6 +700,143 @@ async def test_route_without_permission_is_public(permission_datasette):
 
 
 @pytest.mark.asyncio
+async def test_delete_route_with_int_url_var():
+    datasette = Datasette(memory=True)
+    router = Router()
+
+    @router.DELETE(r"^/-/things/(?P<id>\d+)$")
+    async def delete_thing(id: int):
+        return Response.json({"deleted": id})
+
+    class TestPlugin:
+        __name__ = "DeleteTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="delete-test-plugin")
+
+        r = await datasette.client.delete("/-/things/7")
+        assert r.status_code == 200
+        assert r.json() == {"deleted": 7}
+
+        r = await datasette.client.get("/-/things/7")
+        assert r.status_code == 405
+        assert r.headers["allow"] == "DELETE"
+    finally:
+        datasette.pm.unregister(name="delete-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_put_route_with_body():
+    datasette = Datasette(memory=True)
+
+    class In(BaseModel):
+        name: str
+
+    router = Router()
+
+    @router.PUT(r"^/-/things/put$")
+    async def put_thing(params: Annotated[In, Body()]):
+        return Response.json({"name": params.name})
+
+    class TestPlugin:
+        __name__ = "PutTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="put-test-plugin")
+
+        r = await datasette.client.put("/-/things/put", json={"name": "widget"})
+        assert r.status_code == 200
+        assert r.json() == {"name": "widget"}
+
+        bad = await datasette.client.put("/-/things/put", json={})
+        assert bad.status_code == 400
+        assert "errors" in bad.json()
+    finally:
+        datasette.pm.unregister(name="put-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_patch_and_put_on_same_path():
+    datasette = Datasette(memory=True)
+
+    class In(BaseModel):
+        name: str
+
+    router = Router()
+
+    @router.PUT(r"^/-/things/same$")
+    async def put_thing(params: Annotated[In, Body()]):
+        return Response.json({"method": "put", "name": params.name})
+
+    @router.PATCH(r"^/-/things/same$")
+    async def patch_thing(params: Annotated[In, Body()]):
+        return Response.json({"method": "patch", "name": params.name})
+
+    class TestPlugin:
+        __name__ = "PatchPutTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="patch-put-test-plugin")
+
+        r = await datasette.client.patch("/-/things/same", json={"name": "a"})
+        assert r.status_code == 200
+        assert r.json() == {"method": "patch", "name": "a"}
+
+        r = await datasette.client.put("/-/things/same", json={"name": "b"})
+        assert r.status_code == 200
+        assert r.json() == {"method": "put", "name": "b"}
+
+        r = await datasette.client.post("/-/things/same", json={"name": "c"})
+        assert r.status_code == 405
+        assert r.headers["allow"] == "PATCH, PUT"
+    finally:
+        datasette.pm.unregister(name="patch-put-test-plugin")
+
+
+def test_openapi_emits_put_delete_patch():
+    class In(BaseModel):
+        name: str
+
+    router = Router(title="Mutations API", version="1.0.0", server_url="http://example.com")
+
+    @router.PUT(r"^/-/things/(?P<id>\d+)$")
+    async def put_thing(id: int, params: Annotated[In, Body()]):
+        return Response.json({"id": id, "name": params.name})
+
+    @router.DELETE(r"^/-/things/(?P<id>\d+)$")
+    async def delete_thing(id: int):
+        return Response.json({"deleted": id})
+
+    @router.PATCH(r"^/-/things/other$")
+    async def patch_thing(params: Annotated[In, Body()]):
+        return Response.json({"name": params.name})
+
+    spec = router.openapi_document_json()
+
+    thing_path = spec["paths"]["/-/things/{id}"]
+    assert set(thing_path.keys()) == {"put", "delete"}
+    assert thing_path["put"]["requestBody"]["required"] is True
+    assert (
+        "properties"
+        in thing_path["put"]["requestBody"]["content"]["application/json"]["schema"]
+    )
+
+    assert "patch" in spec["paths"]["/-/things/other"]
+
+
+@pytest.mark.asyncio
 async def test_permission_without_datasette_raises():
     from datasette.utils.asgi import Request
 

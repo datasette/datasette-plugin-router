@@ -9,7 +9,7 @@ WIP router for Datasette plugins
 
 Datasette plugins that have a lot of [custom API endpoints](https://docs.datasette.io/en/stable/plugin_hooks.html#register-routes-datasette) can get tiresome to write by hand.  `datasette-plugin-router` aims to be a small Python library that adds a FastAPI-like API for defining custom Datasette plugin endpoints.
 
-- Define routes with familiar GET/POST decorators
+- Define routes with familiar `GET`, `POST`, `PUT`, `PATCH` and `DELETE` decorators
 - Define Pydantic-backed input/output schemas on JSON endpoints
 - `register_routes()` compatability
 - export to OpenAPI schema for codegen'ing clients
@@ -69,6 +69,16 @@ to a `GET` route is served by the `GET` handler; any other method gets a
 Registering `@router.GET` and `@router.POST` on the same path regex is
 supported: `router.routes()` returns one entry per path, which dispatches each
 request to the handler for its method.
+
+Five decorators are available: `@router.GET`, `@router.POST`, `@router.PUT`,
+`@router.PATCH` and `@router.DELETE`, all with the same
+`(path, *, output=None, permission=None)` signature. For example:
+
+```python
+@router.DELETE(r"^/-/things/(?P<id>\d+)$")
+async def delete_thing(id: int):
+    return Response.json({"deleted": id})
+```
 
 ## Handler parameters
 
