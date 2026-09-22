@@ -323,15 +323,17 @@ def test_view_carries_handler_identity():
         """Handler docstring."""
         return Response.text("ok")
 
-    # The decorator returns the wrapper, so `my_handler` is the view here.
-    view = router.routes()[0][1]
-    assert view is my_handler
-    assert view.__name__ == "my_handler"
-    assert view.__doc__ == "Handler docstring."
-    assert view.__qualname__.endswith("my_handler")
-    # functools.wraps would set __wrapped__, which makes inspect.signature()
-    # report the handler's signature and breaks Datasette's injection.
-    assert not hasattr(view, "__wrapped__")
+    # The decorator returns the per-route view, so `my_handler` is the view
+    # here; routes() hands Datasette a method dispatcher that wraps it. Both
+    # must carry the handler's identity.
+    dispatcher = router.routes()[0][1]
+    for view in (my_handler, dispatcher):
+        assert view.__name__ == "my_handler"
+        assert view.__doc__ == "Handler docstring."
+        assert view.__qualname__.endswith("my_handler")
+        # functools.wraps would set __wrapped__, which makes inspect.signature()
+        # report the handler's signature and breaks Datasette's injection.
+        assert not hasattr(view, "__wrapped__")
 
 
 @pytest.mark.asyncio
@@ -399,3 +401,81 @@ async def test_legacy_body_subscript_syntax():
         assert bad.status_code == 400
     finally:
         datasette.pm.unregister(name="legacy-body-test-plugin")
+
+
+def _method_test_router():
+    router = Router()
+
+    @router.POST(r"/delete-thing$")
+    async def delete_thing():
+        return Response.json({"deleted": 7})
+
+    @router.GET(r"/read-thing$")
+    async def read_thing():
+        return Response.json({"read": True})
+
+    @router.GET(r"/items$")
+    async def list_items():
+        return Response.text("GET handler")
+
+    @router.POST(r"/items$")
+    async def create_item():
+        return Response.text("POST handler")
+
+    return router
+
+
+@pytest.mark.asyncio
+async def test_http_method_dispatch():
+    datasette = Datasette(memory=True)
+    router = _method_test_router()
+
+    class TestPlugin:
+        __name__ = "MethodDispatchTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="method-dispatch-test-plugin")
+
+        # GET on a POST-declared route is rejected
+        r = await datasette.client.get("/delete-thing")
+        assert r.status_code == 405
+        assert r.headers["allow"] == "POST"
+        assert "error" in r.json()
+
+        # PUT on a GET-declared route is rejected; HEAD is advertised
+        r = await datasette.client.put("/read-thing")
+        assert r.status_code == 405
+        assert r.headers["allow"] == "GET, HEAD"
+
+        # GET and POST on the same regex each reach their own handler
+        r = await datasette.client.get("/items")
+        assert r.status_code == 200
+        assert r.text == "GET handler"
+        r = await datasette.client.post("/items")
+        assert r.status_code == 200
+        assert r.text == "POST handler"
+        r = await datasette.client.request("DELETE", "/items")
+        assert r.status_code == 405
+        assert r.headers["allow"] == "GET, HEAD, POST"
+
+        # HEAD on a GET route is served by the GET handler
+        r = await datasette.client.head("/read-thing")
+        assert r.status_code == 200
+    finally:
+        datasette.pm.unregister(name="method-dispatch-test-plugin")
+
+
+def test_routes_one_tuple_per_path():
+    router = _method_test_router()
+    routes = router.routes()
+    assert [path for path, _ in routes] == [r"/delete-thing$", r"/read-thing$", r"/items$"]
+    views = dict(routes)
+    assert views[r"/items$"].__name__ == "list_items_or_create_item"
+    assert views[r"/items$"].__qualname__ == "list_items_or_create_item"
+    assert views[r"/items$"].__doc__ is None
+    assert views[r"/read-thing$"].__name__ == "read_thing"
+    assert not hasattr(views[r"/items$"], "__wrapped__")
