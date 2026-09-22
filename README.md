@@ -87,6 +87,7 @@ resolved at registration.
 
 - `request`, `datasette`, `scope`, `receive` and `send` get the Datasette values.
 - `Annotated[Model, Body()]` (or legacy `Body[Model]`) gets the validated request body.
+- `Annotated[Model, Form()]` gets a validated form-encoded body (see "Form bodies" below).
 - `Annotated[T, Query()]` gets a typed query-string value (see "Query parameters" below).
 - A parameter annotated `str`, `int`, `float`, `uuid.UUID` or `datetime.date`
   gets the URL var of the same name, converted to that type; its name must be
@@ -171,6 +172,50 @@ only happens when a handler returns a dict or a model. A returned dict or
 model that does not match `output=` is a bug in the handler, so it raises a
 `TypeError` (naming the handler, the route and the Pydantic errors) and the
 client gets a **500**, not a 400.
+
+## Form bodies
+
+`Body()` parses JSON. To accept a plain HTML `<form method="post">`
+submission instead, annotate the parameter with `Form()`:
+
+```python
+from typing import Annotated
+from pydantic import BaseModel
+from datasette_plugin_router import Router, Form
+
+class Signup(BaseModel):
+    name: str
+    count: int = 1
+    tags: list[str] = []
+
+@router.POST(r"^/-/signup$")
+async def signup(params: Annotated[Signup, Form()]):
+    ...
+```
+
+- The body may be `application/x-www-form-urlencoded` or
+  `multipart/form-data`; it is read with Datasette's `request.form()`.
+- Each model field is read from the form field of the same name (or its
+  alias). Scalars take the first value; `list[...]` / `List[...]` fields
+  collect every value of a repeated key (`tags=a&tags=b` gives
+  `["a", "b"]`). An absent key falls back to the model default.
+- Values are validated with `model_validate()`, so `"5"` coerces to an
+  `int` field. A missing or invalid field gets the usual **400** (see
+  "Request body validation errors" below), e.g.
+  `{"errors": [{"type": "missing", "loc": ["name"], ...}]}`.
+- A request with any other content type (e.g. a JSON body) or none gets a
+  **400**:
+  `{"error": "body: expected application/x-www-form-urlencoded or multipart/form-data", "errors": [{"type": "form_parsing", "loc": ["body"], "msg": "..."}]}`.
+- A route may use `Body()` or `Form()`, not both; mixing them (on one
+  parameter or across parameters) raises `ValueError` at import time.
+- File uploads are out of scope: `request.form()` discards file parts by
+  default, so a file field is never bound. Take `request` and call
+  `await request.form(files=True)` yourself to handle uploads.
+- In the OpenAPI document the route's `requestBody` is keyed
+  `application/x-www-form-urlencoded` instead of `application/json`.
+
+Datasette's CSRF check is origin-based, so a form post needs no hidden
+`csrftoken` field (see "CSRF and browser clients" below).
 
 ## Permissions
 
