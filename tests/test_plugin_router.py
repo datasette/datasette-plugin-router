@@ -313,3 +313,89 @@ async def test_body_oversize_returns_413():
 
     finally:
         datasette.pm.unregister(name="oversize-test-plugin")
+
+
+def test_view_carries_handler_identity():
+    router = Router()
+
+    @router.GET(r"/ident$")
+    async def my_handler():
+        """Handler docstring."""
+        return Response.text("ok")
+
+    # The decorator returns the wrapper, so `my_handler` is the view here.
+    view = router.routes()[0][1]
+    assert view is my_handler
+    assert view.__name__ == "my_handler"
+    assert view.__doc__ == "Handler docstring."
+    assert view.__qualname__.endswith("my_handler")
+    # functools.wraps would set __wrapped__, which makes inspect.signature()
+    # report the handler's signature and breaks Datasette's injection.
+    assert not hasattr(view, "__wrapped__")
+
+
+@pytest.mark.asyncio
+async def test_request_datasette_and_url_vars_injected():
+    datasette = Datasette(memory=True)
+    router = Router()
+    captured = {}
+
+    @router.GET(r"/things/(?P<slug>[a-z]+)/(?P<n>\d+)$")
+    async def thing(request, datasette, slug: str, n: int):
+        """Thing handler."""
+        captured.update(request=request, datasette=datasette, slug=slug, n=n)
+        return Response.json({"slug": slug, "n": n})
+
+    class TestPlugin:
+        __name__ = "InjectionTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="injection-test-plugin")
+
+        result = await datasette.client.get("/things/abc/7")
+        assert result.status_code == 200
+        assert result.json() == {"slug": "abc", "n": 7}
+        assert captured["datasette"] is datasette
+        assert captured["request"].path == "/things/abc/7"
+        assert type(captured["slug"]) is str
+        assert type(captured["n"]) is int
+    finally:
+        datasette.pm.unregister(name="injection-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_legacy_body_subscript_syntax():
+    datasette = Datasette(memory=True)
+
+    class Input(BaseModel):
+        id: int
+
+    router = Router()
+
+    @router.POST(r"/legacy$")
+    async def legacy(params: Body[Input]):  # type: ignore[valid-type]
+        assert isinstance(params, Input)
+        return Response.json({"id": params.id})
+
+    class TestPlugin:
+        __name__ = "LegacyBodyTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="legacy-body-test-plugin")
+
+        result = await datasette.client.post("/legacy", json={"id": 5})
+        assert result.status_code == 200
+        assert result.json() == {"id": 5}
+
+        bad = await datasette.client.post("/legacy", json={"id": "nope"})
+        assert bad.status_code == 400
+    finally:
+        datasette.pm.unregister(name="legacy-body-test-plugin")
