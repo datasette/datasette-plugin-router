@@ -455,6 +455,10 @@ class Router:
             "paths": {},
         }
 
+        # (entry, operation) pairs in registration order, for operationIds.
+        emitted: List[Tuple[Route, Dict[str, Any]]] = []
+        uses_validation_error = False
+
         for entry in self._routes:
             path = entry.path
             openapi_path = _regex_to_openapi_path(path)
@@ -494,26 +498,91 @@ class Router:
                     parameters.append(param)
 
             operation: Dict[str, Any] = {"responses": {"200": {"description": "OK"}}, "parameters": parameters}
+            where = f"{method.upper()} {path}"
 
             # Use precomputed schemas stored on the Route entry
             if entry.input_schema is not None:
                 # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
-                processed_schema = _extract_defs_from_schema(entry.input_schema, components_schemas)
+                processed_schema = _extract_defs_from_schema(entry.input_schema, components_schemas, where)
                 operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": processed_schema}}}
 
-            if entry.output is not None:
-                schema = _model_to_schema(entry.output) or {"type": "object"}
+            if entry.output_schema is not None:
                 # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
-                processed_schema = _extract_defs_from_schema(schema, components_schemas)
+                processed_schema = _extract_defs_from_schema(entry.output_schema, components_schemas, where)
                 operation["responses"]["200"]["content"] = {"application/json": {"schema": processed_schema}}
 
+            # The router answers bad bodies, query strings and int url vars
+            # with a 400 {"error", "errors"}; permission denials with a 403.
+            can_400 = (
+                entry.input_schema is not None
+                or any(p["in"] == "query" for p in parameters)
+                or any(p["in"] == "path" and p["schema"]["type"] == "integer" for p in parameters)
+            )
+            if can_400:
+                uses_validation_error = True
+                operation["responses"]["400"] = {
+                    "description": "Validation error",
+                    "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ValidationError"}}},
+                }
+            if entry.permission is not None:
+                operation["responses"]["403"] = {"description": "Forbidden"}
+
             doc["paths"].setdefault(openapi_path, {})[method] = operation
+            emitted.append((entry, operation))
+
+        # Assign operationIds in registration order, skipping operations a
+        # later registration of the same path+method replaced. They go first
+        # in each operation; replacing an existing dict key keeps its position.
+        taken: set = set()
+        for entry, operation in emitted:
+            openapi_path = _regex_to_openapi_path(entry.path)
+            method = entry.method.lower()
+            if doc["paths"][openapi_path][method] is not operation:
+                continue
+            base = getattr(entry.fn, "__name__", None) or "handler"
+            operation_id = base
+            if operation_id in taken:
+                operation_id = f"{base}_{method}"
+                n = 2
+                while operation_id in taken:
+                    operation_id = f"{base}_{method}_{n}"
+                    n += 1
+            taken.add(operation_id)
+            head: Dict[str, Any] = {"operationId": operation_id}
+            doc_text = inspect.cleandoc(getattr(entry.fn, "__doc__", None) or "")
+            if doc_text:
+                summary, _, rest = doc_text.partition("\n")
+                head["summary"] = summary.strip()
+                description = rest.strip()
+                if description:
+                    head["description"] = description
+            doc["paths"][openapi_path][method] = {**head, **operation}
+
+        if uses_validation_error:
+            if "ValidationError" in components_schemas:
+                raise ValueError(
+                    "OpenAPI components.schemas name collision: a route's model is named "
+                    "'ValidationError', which is reserved for the router's 400 error schema"
+                )
+            components_schemas["ValidationError"] = dict(_VALIDATION_ERROR_SCHEMA)
 
         # Add components.schemas if any $defs were extracted
         if components_schemas:
             doc["components"] = {"schemas": components_schemas}
 
         return doc
+
+
+# Shape of the router's 400 responses (see _validation_error_response).
+_VALIDATION_ERROR_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "error": {"type": "string"},
+        "errors": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["error", "errors"],
+}
+
 
 def _make_dispatcher(views: Dict[str, Callable]) -> Callable:
     """Build one view that routes a request to views[METHOD], else returns 405."""
@@ -599,33 +668,39 @@ def _unbindable_reason(name: str, annotation: Any) -> str:
 
 
 def _model_to_schema(model: type) -> Optional[Dict[str, Any]]:
+    """JSON schema for a model class.
+
+    Errors from model_json_schema()/schema() propagate (at registration) so a
+    broken model never ships a silently wrong spec. Classes with neither get a
+    string-typed object built from __annotations__.
+    """
     if model is None:
         return None
     mjs = getattr(model, "model_json_schema", None)
     if callable(mjs):
-        try:
-            return mjs()  # type: ignore[no-any-return]
-        except Exception:
-            pass
+        return mjs()  # type: ignore[no-any-return]
     schema_fn = getattr(model, "schema", None)
     if callable(schema_fn):
-        try:
-            return schema_fn()  # type: ignore[no-any-return]
-        except Exception:
-            pass
+        return schema_fn()  # type: ignore[no-any-return]
     ann = getattr(model, "__annotations__", None)
     if isinstance(ann, dict):
         return {"type": "object", "properties": {k: {"type": "string"} for k in ann.keys()}}
     return None
 
 
-def _extract_defs_from_schema(schema: Dict[str, Any], components_schemas: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_defs_from_schema(
+    schema: Dict[str, Any], components_schemas: Dict[str, Any], where: Optional[str] = None
+) -> Dict[str, Any]:
     """Extract $defs from a schema, add them to components_schemas, and rewrite $refs.
 
     Pydantic's model_json_schema() generates JSON Schema 2020-12 style with $defs
     for nested model references. OpenAPI 3.0 expects schemas under #/components/schemas/.
     This function extracts $defs, moves them to components_schemas, and rewrites
     $ref values from #/$defs/ModelName to #/components/schemas/ModelName.
+
+    A $defs name already in components_schemas with a different definition
+    (two distinct classes sharing a name) raises ValueError; `where` names the
+    operation being processed in that message.
     """
     if not isinstance(schema, dict):
         return schema
@@ -639,6 +714,13 @@ def _extract_defs_from_schema(schema: Dict[str, Any], components_schemas: Dict[s
         for name, definition in defs.items():
             # Recursively process nested $defs in definitions
             processed_def = _rewrite_refs(definition)
+            existing = components_schemas.get(name)
+            if existing is not None and existing != processed_def:
+                context = f" (while processing {where})" if where else ""
+                raise ValueError(
+                    "OpenAPI components.schemas name collision: two different models are "
+                    f"named {name!r}{context}; rename one of them"
+                )
             components_schemas[name] = processed_def
 
     # Rewrite $refs in the schema
@@ -668,13 +750,63 @@ def _extract_named_groups(regex: str) -> List[str]:
     return list(pattern.groupindex.keys())
 
 def _regex_to_openapi_path(regex: str) -> str:
-    try:
-        path = regex
-        if path.startswith("^"):
-            path = path[1:]
-        if path.endswith("$"):
-            path = path[:-1]
-        path = re.sub(r"\(\?P<([^>]+)>[^)]+\)", r"{\1}", path)
-        return path
-    except Exception:
-        return regex
+    """Convert a route regex to an OpenAPI path template.
+
+    Each top-level named group (?P<name>...) becomes {name}; backslash-escaped
+    literals outside groups are unescaped (\\. -> .). Everything else,
+    including unnamed or non-capturing groups, is copied through verbatim.
+    """
+    path = regex
+    if path.startswith("^"):
+        path = path[1:]
+    if path.endswith("$") and not path.endswith("\\$"):
+        path = path[:-1]
+    out: List[str] = []
+    i = 0
+    n = len(path)
+    while i < n:
+        c = path[i]
+        if c == "\\" and i + 1 < n:
+            out.append(path[i + 1])
+            i += 2
+        elif path.startswith("(?P<", i) and ">" in path[i:]:
+            close = path.index(">", i)
+            out.append("{" + path[i + 4 : close] + "}")
+            i = _skip_group(path, close + 1)
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _skip_group(regex: str, i: int) -> int:
+    """Return the index just past the ')' closing the group whose body starts at i.
+
+    Nested groups are counted; parens inside [...] or escaped are ignored.
+    """
+    depth = 1
+    in_class = False
+    n = len(regex)
+    while i < n:
+        c = regex[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+            # A ']' right after '[' or '[^' is a literal, not the class end.
+            if regex.startswith("^", i + 1):
+                i += 1
+            if regex.startswith("]", i + 1):
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n

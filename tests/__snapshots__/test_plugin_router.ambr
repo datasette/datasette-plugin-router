@@ -1,6 +1,28 @@
 # serializer version: 1
 # name: test_spec[router spec]
   dict({
+    'components': dict({
+      'schemas': dict({
+        'ValidationError': dict({
+          'properties': dict({
+            'error': dict({
+              'type': 'string',
+            }),
+            'errors': dict({
+              'items': dict({
+                'type': 'object',
+              }),
+              'type': 'array',
+            }),
+          }),
+          'required': list([
+            'error',
+            'errors',
+          ]),
+          'type': 'object',
+        }),
+      }),
+    }),
     'info': dict({
       'title': 'Test API',
       'version': '1.2.3',
@@ -9,6 +31,7 @@
     'paths': dict({
       '/hello/{name}': dict({
         'get': dict({
+          'operationId': 'hello',
           'parameters': list([
             dict({
               'in': 'path',
@@ -28,6 +51,7 @@
       }),
       '/test': dict({
         'post': dict({
+          'operationId': 'test_endpoint',
           'parameters': list([
           ]),
           'requestBody': dict({
@@ -70,6 +94,16 @@
                 }),
               }),
               'description': 'OK',
+            }),
+            '400': dict({
+              'content': dict({
+                'application/json': dict({
+                  'schema': dict({
+                    '$ref': '#/components/schemas/ValidationError',
+                  }),
+                }),
+              }),
+              'description': 'Validation error',
             }),
           }),
         }),

@@ -255,3 +255,20 @@ body or malformed JSON — the router returns a **400** instead of a 500:
   location, e.g. malformed JSON) with `"; "`.
 - `errors` is `ValidationError.errors()` minus the `url`/`ctx`/`input` fields.
 - Messages are Pydantic's `msg` verbatim, so custom validator messages pass through.
+
+## OpenAPI export
+
+`router.openapi_document_json()` returns an OpenAPI 3.0 document as a dict.
+
+- Each operation's `operationId` is the handler's function name. Duplicates get
+  `_<method>` appended (`index`, then `index_post`), then `_2`, `_3`, ... in
+  registration order.
+- The handler docstring's first line becomes `summary`; the rest, if any,
+  becomes `description`.
+- Operations with a `Body()`, a `Query()` parameter or an `int` path parameter
+  declare a **400** response (`#/components/schemas/ValidationError`, the
+  `{"error", "errors"}` shape above); routes with `permission=` declare a **403**.
+- Two different nested models with the same class name raise `ValueError`
+  instead of silently sharing one `components.schemas` entry.
+- Adding `operationId`s changes the method names that client generators such
+  as `@hey-api/openapi-ts` produce, so regenerate clients once after upgrading.
