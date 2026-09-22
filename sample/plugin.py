@@ -1,5 +1,6 @@
 from datasette import Response, hookimpl
 from datasette_plugin_router import Router, Body
+from markupsafe import escape
 from pydantic import BaseModel
 from pathlib import Path
 from typing import Annotated
@@ -30,7 +31,7 @@ async def demo1(params: Annotated[Input, Body()]):
 
 @router.GET(r"/-/hello/(?P<name>.*)$")
 async def hello(name: str):
-    return Response.html(f"<h1>Hello, {name}!</h1>")
+    return Response.html(f"<h1>Hello, {escape(name)}!</h1>")
 
 
 @hookimpl

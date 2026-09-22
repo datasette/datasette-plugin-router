@@ -1,6 +1,7 @@
 from datasette.app import Datasette
 import pytest
 from datasette_plugin_router import Router, Body
+from markupsafe import escape
 from pydantic import BaseModel
 from datasette import hookimpl, Response
 from pydantic import field_validator
@@ -36,7 +37,7 @@ async def test_spec(snapshot):
     
     @router.GET(r"/hello/(?P<name>.*)$")
     async def hello(name: str):
-        return Response.html(f"<h1>Hello, {name}!</h1>")
+        return Response.html(f"<h1>Hello, {escape(name)}!</h1>")
     
     assert router.openapi_document_json() == snapshot(name="router spec")
     
