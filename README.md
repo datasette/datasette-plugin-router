@@ -133,6 +133,31 @@ permissions:
     id: alice
 ```
 
+## CSRF and browser clients
+
+Routes registered through the router are ordinary Datasette routes, so
+Datasette's cross-origin protection applies to them. `POST` (and any other
+non-safe method) is checked; `GET`, `HEAD` and `OPTIONS` are never checked, so
+a mutation must not be hidden behind a `GET` route (see "HTTP method
+dispatch" above).
+
+A same-origin browser `fetch()` sending JSON just works: browsers set
+`Sec-Fetch-Site: same-origin` on same-origin requests, and that alone lets
+the request through — no token or extra header is needed. Legacy
+`x-csrftoken` headers do nothing here and can be dropped from old frontends.
+
+A cross-site request that carries cookies gets a **403** by design; that's
+the protection working, not a bug.
+
+For API clients: send `Authorization: Bearer <token>` **without** a `Cookie`
+header — bearer auth with no cookie is exempt from the check. Non-browser
+clients that send neither `Origin` nor `Sec-Fetch-Site` (curl, most HTTP
+libraries) also pass through unchecked.
+
+This describes Datasette >= 1.0a27's Origin/`Sec-Fetch-Site` based check,
+which is within this package's supported range (Datasette >= 1.0a36, see
+above).
+
 ## Request body validation errors
 
 If a `Body()`-injected request body fails Pydantic validation — including an empty
