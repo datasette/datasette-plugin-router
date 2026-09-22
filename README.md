@@ -86,6 +86,52 @@ resolved at registration.
 - A value that `int()` cannot parse for an `int` parameter gets a **400**
   (`{"error": "id: value is not a valid integer", "errors": [{"type": "int_parsing", ...}]}`).
 
+## Permissions
+
+Routes are public unless you pass `permission=` to `GET` or `POST`:
+
+```python
+@router.POST(r"^/-/things$", permission="my-plugin-access")
+async def create_thing(params: Annotated[Input, Body()]):
+    ...
+```
+
+Before binding any parameters the router calls
+`await datasette.allowed(action="my-plugin-access", actor=request.actor)`.
+The check runs before the request body is read, so a denied request gets a
+403 even when its body is invalid.
+
+A denial raises Datasette's `Forbidden`, so any `forbidden()` plugin hook on
+the instance can customise the response. With Datasette's default hook:
+
+- JSON clients (path ending in `.json`, an `Accept` header containing
+  `application/json`, or a `Content-Type: application/json` request) get a
+  **403** `application/json` response:
+  `{"ok": false, "error": "Permission denied: my-plugin-access", "errors": ["Permission denied: my-plugin-access"], "status": 403}`
+- Everything else gets a **403** HTML error page with the same message.
+
+The action has to be registered with Datasette's
+[`register_actions`](https://docs.datasette.io/en/latest/plugin_hooks.html#register-actions)
+hook. `datasette.allowed()` raises `ValueError("Unknown action: ...")` for an
+action name that was never registered, so the request fails with a 500
+instead of a 403.
+
+```python
+from datasette.permissions import Action
+
+@hookimpl
+def register_actions(datasette):
+    return [Action(name="my-plugin-access", description="Use my-plugin")]
+```
+
+Grant the action like any other, for example in `datasette.yaml`:
+
+```yaml
+permissions:
+  my-plugin-access:
+    id: alice
+```
+
 ## Request body validation errors
 
 If a `Body()`-injected request body fails Pydantic validation — including an empty
