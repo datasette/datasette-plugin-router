@@ -119,8 +119,19 @@ class Router:
             input_model = None
             input_model_found = False
             signature_error: Optional[Exception] = None
+            # (param name, reason) for required params that cannot be bound;
+            # raised below, outside the try, so it is never swallowed.
+            unbindable: List[Tuple[str, str]] = []
             try:
-                for pname, pparam in inspect.signature(fn).parameters.items():
+                # Resolve string annotations (from __future__ import annotations);
+                # fall back to raw ones if a forward reference can't be evaluated.
+                try:
+                    signature = inspect.signature(fn, eval_str=True)
+                except Exception:
+                    signature = inspect.signature(fn)
+                for pname, pparam in signature.parameters.items():
+                    if pparam.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                        continue
                     annotation = pparam.annotation
                     if pname in path_param_names and isinstance(annotation, type):
                         param_types[pname] = annotation
@@ -134,15 +145,21 @@ class Router:
                         plan.append(_Binding(pname, "special"))
                     elif body_model is not None:
                         plan.append(_Binding(pname, "body", body_model))
-                    elif annotation is str:
+                    elif annotation is str and pname in path_param_names:
                         plan.append(_Binding(pname, "str_var"))
-                    elif annotation is int:
+                    elif annotation is int and pname in path_param_names:
                         plan.append(_Binding(pname, "int_var"))
-                    # Anything else is silently not injected (unchanged behavior).
+                    elif pparam.default is inspect.Parameter.empty:
+                        unbindable.append((pname, _unbindable_reason(pname, annotation)))
+                    # Unbindable params with a default are left to that default.
             except Exception as exc:
                 # Still register the route; surface the error when it is called,
                 # as the old per-request inspect.signature() call would have.
                 signature_error = exc
+            if unbindable:
+                pname, reason = unbindable[0]
+                handler = getattr(fn, "__qualname__", repr(fn))
+                raise ValueError(f"Parameter {pname!r} of handler {handler} for route {path!r} {reason}")
             entry.path_param_types = param_types
 
             if input_model is not None:
@@ -183,7 +200,11 @@ class Router:
                     elif kind == "str_var":
                         kwargs[name] = request.url_vars[name]
                     elif kind == "int_var":
-                        kwargs[name] = int(request.url_vars[name])
+                        # int() accepts "1_0" and " 5 "; that is tolerated.
+                        try:
+                            kwargs[name] = int(request.url_vars[name])
+                        except ValueError:
+                            return _int_parsing_error_response(name)
 
                 return await fn(**kwargs)
 
@@ -315,6 +336,34 @@ def _validation_error_response(exc: ValidationError) -> Response:
         parts.append(f"{loc}: {msg}" if loc else msg)
     message = "; ".join(parts) if parts else "Invalid request body"
     return Response.json({"error": message, "errors": errors}, status=400)
+
+
+def _int_parsing_error_response(name: str) -> Response:
+    """400 in the same shape as _validation_error_response, for a bad int url var."""
+    msg = "value is not a valid integer"
+    return Response.json(
+        {"error": f"{name}: {msg}", "errors": [{"type": "int_parsing", "loc": [name], "msg": msg}]},
+        status=400,
+    )
+
+
+def _unbindable_reason(name: str, annotation: Any) -> str:
+    """Explain why a required handler parameter cannot be bound (for the ValueError)."""
+    if annotation is str or annotation is int:
+        return (
+            f"is annotated {annotation.__name__} but {name!r} is not a named group in the route regex"
+        )
+    if isinstance(annotation, Body):
+        return "is annotated with a bare Body() that has no model to validate against"
+    if annotation is bool:
+        return (
+            "is annotated bool, which the router cannot bind (bool url vars are not supported; "
+            "expected str/int url var, Body(), or request/datasette/scope/receive/send)"
+        )
+    return (
+        "has no annotation the router can bind (expected str/int url var, Body(), "
+        "or request/datasette/scope/receive/send)"
+    )
 
 
 def _model_to_schema(model: type) -> Optional[Dict[str, Any]]:
