@@ -28,6 +28,7 @@ Sample usage:
 from datasette import Response, hookimpl
 from datasette_plugin_router import Router, Body
 from pydantic import BaseModel
+from markupsafe import escape
 
 router = Router()
 
@@ -50,7 +51,7 @@ async def demo1(params: Body[Input]) -> Output:
 
 @router.GET(r"/-/hello/(?P<name>.*)$")
 async def hello(name: str):
-    return Response.html(f"<h1>Hello, {name}!</h1>")
+    return Response.html(f"<h1>Hello, {escape(name)}!</h1>")
 
 
 @hookimpl
