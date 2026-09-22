@@ -72,7 +72,8 @@ request to the handler for its method.
 ## Handler parameters
 
 Handler parameters are bound by name and annotation when the route is
-registered:
+registered. String annotations (`from __future__ import annotations`) are
+resolved at registration.
 
 - `request`, `datasette`, `scope`, `receive` and `send` get the Datasette values.
 - `Annotated[Model, Body()]` (or legacy `Body[Model]`) gets the validated request body.

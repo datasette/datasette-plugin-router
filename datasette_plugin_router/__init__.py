@@ -123,7 +123,13 @@ class Router:
             # raised below, outside the try, so it is never swallowed.
             unbindable: List[Tuple[str, str]] = []
             try:
-                for pname, pparam in inspect.signature(fn).parameters.items():
+                # Resolve string annotations (from __future__ import annotations);
+                # fall back to raw ones if a forward reference can't be evaluated.
+                try:
+                    signature = inspect.signature(fn, eval_str=True)
+                except Exception:
+                    signature = inspect.signature(fn)
+                for pname, pparam in signature.parameters.items():
                     if pparam.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                         continue
                     annotation = pparam.annotation
