@@ -1,7 +1,7 @@
 from __future__ import annotations
 import inspect
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
 from dataclasses import dataclass
 
 from datasette import Response
@@ -59,6 +59,36 @@ class Body:
         """
         return cls(item)
 
+_SPECIAL_PARAMS = frozenset({"request", "datasette", "scope", "receive", "send"})
+
+
+class _Binding(NamedTuple):
+    """One step of a view's precomputed parameter binding plan.
+
+    kind is one of "special", "body", "str_var", "int_var"; model is the
+    Pydantic model class for "body" bindings and None otherwise.
+    """
+
+    name: str
+    kind: str
+    model: Optional[type] = None
+
+
+def _body_model_from_annotation(annotation: Any) -> Optional[type]:
+    """Return the model for Annotated[Model, Body()] or legacy Body[Model], else None."""
+    if get_origin(annotation) is Annotated:
+        args = get_args(annotation)
+        if len(args) >= 2:
+            # args[0] is the actual type, args[1:] are metadata
+            for metadata in args[1:]:
+                if isinstance(metadata, Body):
+                    return args[0]
+        return None
+    if isinstance(annotation, Body):
+        return annotation.model
+    return None
+
+
 class Router:
     """Minimal router to simplify Datasette plugin route registration and OpenAPI export."""
 
@@ -79,38 +109,41 @@ class Router:
             # create route entry and compute/store input/output schemas now so
             # we don't need to keep references to the original function
             entry = Route(path=path, output=output, method=method, fn=None)
-            # Capture annotation types for any URL-var path parameters so the
-            # OpenAPI emitter can pick the right schema type per param.
+            # Walk the handler signature once, at decoration time, producing
+            # both the OpenAPI path-param types and the per-request binding
+            # plan. The view wrapper below only iterates the plan, so no
+            # signature/typing introspection happens on the request path.
             path_param_names = set(_extract_named_groups(path))
             param_types: Dict[str, type] = {}
+            plan: List[_Binding] = []
+            input_model = None
+            input_model_found = False
+            signature_error: Optional[Exception] = None
             try:
                 for pname, pparam in inspect.signature(fn).parameters.items():
-                    if pname in path_param_names and isinstance(pparam.annotation, type):
-                        param_types[pname] = pparam.annotation
-            except Exception:
-                pass
+                    annotation = pparam.annotation
+                    if pname in path_param_names and isinstance(annotation, type):
+                        param_types[pname] = annotation
+                    body_model = _body_model_from_annotation(annotation)
+                    # The first Body parameter drives the OpenAPI requestBody
+                    # (a bare legacy Body() annotation also ends the search).
+                    if not input_model_found and (body_model or isinstance(annotation, Body)):
+                        input_model = body_model
+                        input_model_found = True
+                    if pname in _SPECIAL_PARAMS:
+                        plan.append(_Binding(pname, "special"))
+                    elif body_model is not None:
+                        plan.append(_Binding(pname, "body", body_model))
+                    elif annotation is str:
+                        plan.append(_Binding(pname, "str_var"))
+                    elif annotation is int:
+                        plan.append(_Binding(pname, "int_var"))
+                    # Anything else is silently not injected (unchanged behavior).
+            except Exception as exc:
+                # Still register the route; surface the error when it is called,
+                # as the old per-request inspect.signature() call would have.
+                signature_error = exc
             entry.path_param_types = param_types
-            input_model = None
-            # inspect the handler's annotations for Body[...] parameters or Annotated[..., Body()]
-            try:
-                for _, param in inspect.signature(fn).parameters.items():
-                    # Check for Annotated[Model, Body()] pattern
-                    if get_origin(param.annotation) is Annotated:
-                        args = get_args(param.annotation)
-                        if len(args) >= 2:
-                            # args[0] is the actual type, args[1:] are metadata
-                            for metadata in args[1:]:
-                                if isinstance(metadata, Body):
-                                    input_model = args[0]
-                                    break
-                        if input_model:
-                            break
-                    # Check for backwards-compatible Body[Model] pattern
-                    elif isinstance(param.annotation, Body):
-                        input_model = param.annotation.model
-                        break
-            except Exception:
-                input_model = None
 
             if input_model is not None:
                 entry.input_schema = _model_to_schema(input_model) or {"type": "object"}
@@ -122,57 +155,47 @@ class Router:
             # append entry after computing schemas
             self._routes.append(entry)
 
+            # Datasette inspects this exact signature to decide what to inject,
+            # so it must not change (and must not be masked via __wrapped__).
             async def view(request, datasette=None, scope=None, receive=None, send=None):
-                declared_kwargs = inspect.signature(fn).parameters
+                if signature_error is not None:
+                    raise signature_error
+                specials = {
+                    "request": request,
+                    "datasette": datasette,
+                    "scope": scope,
+                    "receive": receive,
+                    "send": send,
+                }
                 kwargs = {}
-                for name, param in declared_kwargs.items():
-                    if name == "request":
-                        kwargs["request"] = request
-                        continue
-                    elif name == "datasette":
-                        kwargs["datasette"] = datasette
-                        continue
-                    elif name == "scope":
-                        kwargs["scope"] = scope
-                        continue
-                    elif name == "receive":
-                        kwargs["receive"] = receive
-                        continue
-                    elif name == "send":
-                        kwargs["send"] = send
-                        continue
-                    
-                    # Check for Annotated[Model, Body()] pattern
-                    body_model = None
-                    if get_origin(param.annotation) is Annotated:
-                        args = get_args(param.annotation)
-                        if len(args) >= 2:
-                            for metadata in args[1:]:
-                                if isinstance(metadata, Body):
-                                    body_model = args[0]
-                                    break
-                    # Check for backwards-compatible Body[Model] pattern
-                    elif isinstance(param.annotation, Body):
-                        body_model = param.annotation.model
-                    
-                    if body_model is not None:
+                for binding in plan:
+                    name = binding.name
+                    kind = binding.kind
+                    if kind == "special":
+                        kwargs[name] = specials[name]
+                    elif kind == "body":
                         data = await request.post_body()
                         try:
-                            model_instance = body_model.model_validate_json(data)  # type: ignore[attr-defined]
+                            model_instance = binding.model.model_validate_json(data)  # type: ignore[union-attr]
                         except ValidationError as exc:
                             return _validation_error_response(exc)
                         kwargs[name] = model_instance
-                        continue
-                    
-                    # see if the str parameter exists in `request.url_vars`.
-                    if param.annotation is str:
+                    elif kind == "str_var":
                         kwargs[name] = request.url_vars[name]
-                        continue
-                    if param.annotation is int:
+                    elif kind == "int_var":
                         kwargs[name] = int(request.url_vars[name])
-                        continue
 
                 return await fn(**kwargs)
+
+            # Carry the handler's identity for tracing/debugging. Deliberately
+            # NOT functools.wraps: that sets __wrapped__, which makes
+            # inspect.signature(view) report fn's signature and breaks
+            # Datasette's argument injection.
+            for attr in ("__module__", "__name__", "__qualname__", "__doc__"):
+                try:
+                    setattr(view, attr, getattr(fn, attr))
+                except AttributeError:
+                    pass
 
             # replace the stored fn with the wrapper that Datasette should call
             entry.fn = view
