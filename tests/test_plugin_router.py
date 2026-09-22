@@ -274,3 +274,42 @@ async def test_body_validation_returns_400():
 
     finally:
         datasette.pm.unregister(name="validation-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_body_oversize_returns_413():
+    """A Body() request larger than Datasette's max_post_body_bytes gets a 413.
+
+    Datasette >= 1.0a36 enforces a 2MB default cap in request.post_body(),
+    which Body() relies on, before the router ever sees the payload.
+    """
+    datasette = Datasette(memory=True)
+
+    class Input(BaseModel):
+        id: int
+
+    router = Router(title="Oversize API", version="1.0.0", server_url="http://example.com")
+
+    @router.POST("/oversize-test")
+    async def oversize_endpoint(params: Annotated[Input, Body()]):
+        return Response.json({"id": params.id})
+
+    class TestPlugin:
+        __name__ = "OversizeTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="oversize-test-plugin")
+
+        result = await datasette.client.post(
+            "/oversize-test",
+            content=b"x" * (3 * 1024 * 1024),
+            headers={"content-type": "application/json"},
+        )
+        assert result.status_code == 413
+
+    finally:
+        datasette.pm.unregister(name="oversize-test-plugin")
