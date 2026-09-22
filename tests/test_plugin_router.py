@@ -479,3 +479,108 @@ def test_routes_one_tuple_per_path():
     assert views[r"/items$"].__doc__ is None
     assert views[r"/read-thing$"].__name__ == "read_thing"
     assert not hasattr(views[r"/items$"], "__wrapped__")
+
+
+@pytest.mark.asyncio
+async def test_bad_int_url_var_returns_400():
+    datasette = Datasette(memory=True)
+    router = Router()
+
+    @router.GET(r"^/-/item/(?P<id>[^/]+)$")
+    async def item(id: int):
+        return Response.json({"id": id})
+
+    class TestPlugin:
+        __name__ = "BadIntTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="bad-int-test-plugin")
+
+        r = await datasette.client.get("/-/item/abc")
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"] == "id: value is not a valid integer"
+        assert body["errors"][0]["type"] == "int_parsing"
+        assert body["errors"][0]["loc"] == ["id"]
+
+        r = await datasette.client.get("/-/item/5")
+        assert r.status_code == 200
+        assert r.json() == {"id": 5}
+    finally:
+        datasette.pm.unregister(name="bad-int-test-plugin")
+
+
+def test_int_param_not_in_regex_raises_at_decoration():
+    router = Router()
+    route = r"^/x/(?P<slug>[^/]+)$"
+    with pytest.raises(ValueError) as excinfo:
+
+        @router.GET(route)
+        async def foo(id: int):
+            return Response.text("unreachable")
+
+    message = str(excinfo.value)
+    assert "'id'" in message
+    assert route in message
+    assert "foo" in message
+    assert "not a named group" in message
+    # The failed registration must not leave a route behind.
+    assert router.routes() == []
+
+
+def test_unannotated_required_param_raises_at_decoration():
+    router = Router()
+    with pytest.raises(ValueError, match="'q'.*no annotation the router can bind"):
+
+        @router.GET(r"^/search$")
+        async def search(q):
+            return Response.text("unreachable")
+
+
+def test_bool_param_raises_at_decoration():
+    router = Router()
+    with pytest.raises(ValueError, match="'flag'.*annotated bool"):
+
+        @router.GET(r"^/b/(?P<flag>[^/]+)$")
+        async def b(flag: bool):
+            return Response.text("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_unbindable_param_with_default_uses_default():
+    datasette = Datasette(memory=True)
+    router = Router()
+
+    @router.GET(r"^/list/(?P<name>[^/]+)$")
+    async def listing(name: str, limit: int = 10):
+        return Response.json({"name": name, "limit": limit})
+
+    class TestPlugin:
+        __name__ = "DefaultParamTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+    try:
+        datasette.pm.register(TestPlugin(), name="default-param-test-plugin")
+
+        r = await datasette.client.get("/list/abc")
+        assert r.status_code == 200
+        assert r.json() == {"name": "abc", "limit": 10}
+    finally:
+        datasette.pm.unregister(name="default-param-test-plugin")
+
+
+def test_var_args_and_kwargs_do_not_raise():
+    router = Router()
+
+    @router.GET(r"^/kw$")
+    async def kw(request, *args, **kwargs):
+        return Response.text("ok")
+
+    assert len(router.routes()) == 1

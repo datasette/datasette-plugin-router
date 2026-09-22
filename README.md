@@ -69,6 +69,22 @@ Registering `@router.GET` and `@router.POST` on the same path regex is
 supported: `router.routes()` returns one entry per path, which dispatches each
 request to the handler for its method.
 
+## Handler parameters
+
+Handler parameters are bound by name and annotation when the route is
+registered:
+
+- `request`, `datasette`, `scope`, `receive` and `send` get the Datasette values.
+- `Annotated[Model, Body()]` (or legacy `Body[Model]`) gets the validated request body.
+- A `str`- or `int`-annotated parameter gets the URL var of the same name; its
+  name must be a named group in the route regex (e.g. `(?P<id>\d+)`).
+- Any other parameter without a default (no annotation, an unsupported type such
+  as `bool`, or a `str`/`int` name missing from the regex) raises `ValueError` at
+  import time, naming the parameter and route. Parameters with defaults, and
+  `*args`/`**kwargs`, are left alone.
+- A value that `int()` cannot parse for an `int` parameter gets a **400**
+  (`{"error": "id: value is not a valid integer", "errors": [{"type": "int_parsing", ...}]}`).
+
 ## Request body validation errors
 
 If a `Body()`-injected request body fails Pydantic validation — including an empty
