@@ -204,12 +204,19 @@ class Router:
         return decorator
 
     def routes(self) -> List[Tuple[str, Callable]]:
-        """Return a list of (regex, view_fn) tuples suitable for Datasette's register_routes."""
-        out: List[Tuple[str, Callable]] = []
+        """Return a list of (regex, view_fn) tuples suitable for Datasette's register_routes.
+
+        Datasette dispatches on the path regex only, so routes are grouped by
+        regex and each unique path gets one dispatcher that enforces the
+        declared HTTP method(s), answering anything else with a 405.
+        """
+        # Preserve first-seen path order; within a path, a later registration
+        # of the same method replaces an earlier one (as the OpenAPI emitter does).
+        by_path: Dict[str, Dict[str, Callable]] = {}
         for entry in self._routes:
             if entry.fn is not None:
-                out.append((entry.path, entry.fn))
-        return out
+                by_path.setdefault(entry.path, {})[entry.method.upper()] = entry.fn
+        return [(path, _make_dispatcher(views)) for path, views in by_path.items()]
 
     def openapi_document_json(self) -> Dict[str, Any]:
         """Return a minimal OpenAPI 3 document as a Python dict."""
@@ -260,6 +267,42 @@ class Router:
             doc["components"] = {"schemas": components_schemas}
 
         return doc
+
+def _make_dispatcher(views: Dict[str, Callable]) -> Callable:
+    """Build one view that routes a request to views[METHOD], else returns 405."""
+    handlers = dict(views)
+    # HEAD is served by the GET handler; the ASGI server drops the body.
+    if "GET" in handlers and "HEAD" not in handlers:
+        handlers["HEAD"] = handlers["GET"]
+    allow = ", ".join(sorted(handlers))
+
+    # Same exact signature as the per-route view: Datasette inspects it to
+    # decide what to inject (and it must not be masked via __wrapped__).
+    async def dispatch(request, datasette=None, scope=None, receive=None, send=None):
+        view = handlers.get(request.method.upper())
+        if view is None:
+            return Response.json(
+                {"error": "Method not allowed"},
+                status=405,
+                headers={"Allow": allow},
+            )
+        return await view(request, datasette=datasette, scope=scope, receive=receive, send=send)
+
+    # Carry handler identity for tracing, manually (no functools.wraps).
+    registered = list(views.values())
+    if len(registered) == 1:
+        for attr in ("__module__", "__name__", "__qualname__", "__doc__"):
+            try:
+                setattr(dispatch, attr, getattr(registered[0], attr))
+            except AttributeError:
+                pass
+    else:
+        name = "_or_".join(getattr(v, "__name__", "view") for v in registered)
+        dispatch.__name__ = name
+        dispatch.__qualname__ = name
+        dispatch.__doc__ = None
+    return dispatch
+
 
 def _validation_error_response(exc: ValidationError) -> Response:
     """Turn a Pydantic ValidationError into a 400 {"error": ..., "errors": [...]} response."""

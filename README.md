@@ -59,6 +59,16 @@ def register_routes():
 
 ```
 
+## HTTP method dispatch
+
+Routes only answer the HTTP method they were declared with. A `HEAD` request
+to a `GET` route is served by the `GET` handler; any other method gets a
+**405** with an `Allow` header listing the registered methods (e.g.
+`Allow: GET, HEAD, POST`) and a `{"error": "Method not allowed"}` JSON body.
+Registering `@router.GET` and `@router.POST` on the same path regex is
+supported: `router.routes()` returns one entry per path, which dispatches each
+request to the handler for its method.
+
 ## Request body validation errors
 
 If a `Body()`-injected request body fails Pydantic validation — including an empty
