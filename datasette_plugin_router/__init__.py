@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from datasette import Forbidden, Response
+from datasette.utils.asgi import BadRequest
 from pydantic import BaseModel, ValidationError, create_model
 
 
@@ -31,6 +32,10 @@ class Route:
     # (parameter name, query-string key, is_list) for each Query() param,
     # in signature order.
     query_fields: Optional[List[Tuple[str, str, bool]]] = None
+    # Media type of the request body described by input_schema:
+    # "application/json" for Body(), "application/x-www-form-urlencoded"
+    # for Form(); None when the route has no body parameter.
+    input_content_type: Optional[str] = None
 
 T = TypeVar('T')
 
@@ -70,6 +75,29 @@ class Body:
         can continue to use `isinstance(param.annotation, Body)`.
         """
         return cls(item)
+
+
+class Form:
+    """Marker for form-encoded request body parameters.
+
+    Usage:
+      from typing import Annotated
+
+      async def view(params: Annotated[InputModel, Form()]):
+          # params is an InputModel validated from an
+          # application/x-www-form-urlencoded or multipart/form-data body
+
+    Each model field is read from the form field of the same name (or its
+    alias); list-typed fields collect every value of a repeated key. File
+    uploads are not bound: use request.form(files=True) directly for those.
+    A route may use Body() or Form(), not both.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    def __repr__(self) -> str:
+        return "Form()"
 
 
 class Query:
@@ -127,9 +155,10 @@ _PATH_PARAM_TYPES: Dict[type, Tuple[Callable[[str], Any], str, Dict[str, str], s
 class _Binding(NamedTuple):
     """One step of a view's precomputed parameter binding plan.
 
-    kind is one of "special", "body", "str_var", "typed_var", "query"; model
-    is the Pydantic model class for "body" and "query" bindings and None
-    otherwise. converter is set only for "typed_var" bindings, to the
+    kind is one of "special", "body", "form", "str_var", "typed_var", "query";
+    model is the Pydantic model class for "body", "form" and "query" bindings
+    and None otherwise. form_fields is set only for "form" bindings, to a
+    (form key, is_list) pair per model field. converter is set only for "typed_var" bindings, to the
     (convert_fn, error_type, message) entry from _PATH_PARAM_TYPES (minus its
     OpenAPI schema, which is not needed at request time). A single "query"
     binding (named after the first Query() param) binds every Query()
@@ -140,6 +169,7 @@ class _Binding(NamedTuple):
     kind: str
     model: Optional[type] = None
     converter: Optional[Tuple[Callable[[str], Any], str, str]] = None
+    form_fields: Optional[Tuple[Tuple[str, bool], ...]] = None
 
 
 def _body_model_from_annotation(annotation: Any) -> Optional[type]:
@@ -155,6 +185,24 @@ def _body_model_from_annotation(annotation: Any) -> Optional[type]:
     if isinstance(annotation, Body):
         return annotation.model
     return None
+
+
+def _form_model_from_annotation(annotation: Any) -> Optional[type]:
+    """Return the model for Annotated[Model, Form()], else None."""
+    if get_origin(annotation) is Annotated:
+        args = get_args(annotation)
+        for metadata in args[1:]:
+            if isinstance(metadata, Form):
+                return args[0]
+    return None
+
+
+def _form_fields(model: type) -> Tuple[Tuple[str, bool], ...]:
+    """(form key, is_list) for each field of a Form() model."""
+    return tuple(
+        (field.alias or name, get_origin(field.annotation) is list)
+        for name, field in model.model_fields.items()  # type: ignore[attr-defined]
+    )
 
 
 def _query_marker_from_annotation(annotation: Any) -> Tuple[Optional[Query], Any]:
@@ -284,6 +332,9 @@ class Router:
             unbindable: List[Tuple[str, str]] = []
             # (param name, query key, is_list, inner type, default) per Query() param.
             query_params: List[Tuple[str, str, bool, Any, Any]] = []
+            # Names of Body() and Form() params; a route may use only one kind.
+            body_param_names: List[str] = []
+            form_param_names: List[str] = []
             try:
                 # Resolve string annotations (from __future__ import annotations);
                 # fall back to raw ones if a forward reference can't be evaluated.
@@ -302,6 +353,9 @@ class Router:
                         if _has_body_marker(annotation):
                             unbindable.append((pname, "is annotated with both Body() and Query()"))
                             continue
+                        if _form_model_from_annotation(annotation) is not None:
+                            unbindable.append((pname, "is annotated with both Form() and Query()"))
+                            continue
                         is_list = _query_type_is_list(query_inner)
                         if is_list is None:
                             unbindable.append((pname, _unbindable_reason(pname, annotation)))
@@ -310,16 +364,36 @@ class Router:
                             (pname, query_marker.alias or pname, is_list, query_inner, pparam.default)
                         )
                         continue
+                    form_model = _form_model_from_annotation(annotation)
+                    if form_model is not None and _has_body_marker(annotation):
+                        unbindable.append((pname, "is annotated with both Body() and Form()"))
+                        continue
+                    if form_model is not None and not isinstance(getattr(form_model, "model_fields", None), dict):
+                        unbindable.append((pname, f"is annotated Form() with {form_model!r}, which is not a pydantic model"))
+                        continue
                     body_model = _body_model_from_annotation(annotation)
-                    # The first Body parameter drives the OpenAPI requestBody
+                    if body_model is not None or isinstance(annotation, Body):
+                        body_param_names.append(pname)
+                    elif form_model is not None:
+                        form_param_names.append(pname)
+                    # The first Body/Form parameter drives the OpenAPI requestBody
                     # (a bare legacy Body() annotation also ends the search).
                     if not input_model_found and (body_model or isinstance(annotation, Body)):
                         input_model = body_model
                         input_model_found = True
+                        entry.input_content_type = "application/json"
+                    elif not input_model_found and form_model is not None:
+                        input_model = form_model
+                        input_model_found = True
+                        entry.input_content_type = "application/x-www-form-urlencoded"
                     if pname in _SPECIAL_PARAMS:
                         plan.append(_Binding(pname, "special"))
                     elif body_model is not None:
                         plan.append(_Binding(pname, "body", body_model))
+                    elif form_model is not None:
+                        plan.append(
+                            _Binding(pname, "form", form_model, form_fields=_form_fields(form_model))
+                        )
                     elif annotation is str and pname in path_param_names:
                         plan.append(_Binding(pname, "str_var"))
                     elif annotation in _PATH_PARAM_TYPES and pname in path_param_names:
@@ -332,6 +406,12 @@ class Router:
                 # Still register the route; surface the error when it is called,
                 # as the old per-request inspect.signature() call would have.
                 signature_error = exc
+            if body_param_names and form_param_names:
+                unbindable.append((
+                    form_param_names[0],
+                    f"is a Form() parameter but {body_param_names[0]!r} is a Body() parameter; "
+                    "a route may use Body() or Form(), not both",
+                ))
             if unbindable:
                 pname, reason = unbindable[0]
                 handler = getattr(fn, "__qualname__", repr(fn))
@@ -365,7 +445,7 @@ class Router:
                 # One step binds every Query() param; it runs before any body
                 # step so a bad query string never reads the request body.
                 query_binding = _Binding(query_params[0][0], "query", query_model)
-                body_index = next((i for i, b in enumerate(plan) if b.kind == "body"), len(plan))
+                body_index = next((i for i, b in enumerate(plan) if b.kind in ("body", "form")), len(plan))
                 plan.insert(body_index, query_binding)
 
             if input_model is not None:
@@ -430,6 +510,20 @@ class Router:
                         except ValidationError as exc:
                             return _validation_error_response(exc)
                         kwargs[name] = model_instance
+                    elif kind == "form":
+                        try:
+                            form = await request.form()
+                        except BadRequest as exc:
+                            return _form_parsing_error_response(request, str(exc))
+                        form_data: Dict[str, Any] = {}
+                        for key, is_list in binding.form_fields:  # type: ignore[union-attr]
+                            # Absent keys are skipped so model defaults apply.
+                            if key in form:
+                                form_data[key] = form.getlist(key) if is_list else form[key]
+                        try:
+                            kwargs[name] = binding.model.model_validate(form_data)  # type: ignore[union-attr]
+                        except ValidationError as exc:
+                            return _validation_error_response(exc)
                     elif kind == "str_var":
                         kwargs[name] = request.url_vars[name]
                     elif kind == "typed_var":
@@ -532,7 +626,8 @@ class Router:
             if entry.input_schema is not None:
                 # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
                 processed_schema = _extract_defs_from_schema(entry.input_schema, components_schemas, where)
-                operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": processed_schema}}}
+                content_type = entry.input_content_type or "application/json"
+                operation["requestBody"] = {"required": True, "content": {content_type: {"schema": processed_schema}}}
 
             if entry.output_schema is not None:
                 # Extract $defs and rewrite $refs for OpenAPI 3.0 compatibility
@@ -666,6 +761,23 @@ def _param_parsing_error_response(name: str, error_type: str, msg: str) -> Respo
     """400 in the same shape as _validation_error_response, for a bad typed url var."""
     return Response.json(
         {"error": f"{name}: {msg}", "errors": [{"type": error_type, "loc": [name], "msg": msg}]},
+        status=400,
+    )
+
+
+_FORM_MEDIA_TYPES = ("application/x-www-form-urlencoded", "multipart/form-data")
+
+
+def _form_parsing_error_response(request: Any, msg: str) -> Response:
+    """400 in the standard shape for a Form() body request.form() could not parse."""
+    media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if media_type in _FORM_MEDIA_TYPES:
+        # A form content type whose body is malformed or too large.
+        error = f"body: {msg}"
+    else:
+        error = "body: expected application/x-www-form-urlencoded or multipart/form-data"
+    return Response.json(
+        {"error": error, "errors": [{"type": "form_parsing", "loc": ["body"], "msg": msg}]},
         status=400,
     )
 
