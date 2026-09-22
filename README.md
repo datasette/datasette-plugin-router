@@ -42,11 +42,10 @@ class Output(BaseModel):
 
 @router.POST(r"/-/demo1$", output=Output)
 async def demo1(params: Body[Input]) -> Output:
-    output = Output(
+    return Output(
         id_negative=-1 * params.id,
         name_upper=params.name.upper(),
     )
-    return Response.json(output.model_dump())
 
 
 @router.GET(r"/-/hello/(?P<name>.*)$")
@@ -138,6 +137,36 @@ async def search(
 - Query parameters appear in the OpenAPI document as `in: query` parameters
   (named by their alias, if any) with `required`, a JSON schema `type` and any
   `default`, after the route's path parameters.
+
+## Returning models
+
+A handler can return a Pydantic model (or a `dict`) instead of building a
+`Response` itself:
+
+```python
+@router.GET(r"^/-/things/(?P<id>\d+)$", output=Output)
+async def get_thing(id: int) -> Output:
+    return Output(id_negative=-id, name_upper="THING")
+```
+
+The router turns the return value into a response:
+
+- A `Response` (or anything that is not a `BaseModel` or `dict`) is returned
+  untouched, whether or not `output=` is set.
+- A `BaseModel` instance becomes a **200** `application/json` response,
+  serialised with `model_dump_json()` (so `datetime`, `UUID` etc. become
+  JSON strings). If `output=` is set, the instance must be an instance of
+  that class; it is not re-validated.
+- A `dict` is validated with `output.model_validate()` when `output=` is set,
+  then serialised the same way; with no `output=` it is sent as JSON as-is.
+- `output=` validation only applies when it is a Pydantic `BaseModel`
+  subclass; other classes are only used for the OpenAPI document.
+
+Existing handlers that `return Response.json(...)` are unaffected: validation
+only happens when a handler returns a dict or a model. A returned dict or
+model that does not match `output=` is a bug in the handler, so it raises a
+`TypeError` (naming the handler, the route and the Pydantic errors) and the
+client gets a **500**, not a 400.
 
 ## Permissions
 

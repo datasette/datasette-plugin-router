@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeV
 from dataclasses import dataclass
 
 from datasette import Forbidden, Response
-from pydantic import ValidationError, create_model
+from pydantic import BaseModel, ValidationError, create_model
 
 
 @dataclass
@@ -169,6 +169,48 @@ def _query_type_is_list(inner: Any) -> Optional[bool]:
     return None
 
 
+def _json_model_response(model: BaseModel) -> Response:
+    # model_dump_json() so pydantic serialises datetimes, UUIDs, etc.
+    return Response(
+        model.model_dump_json(),
+        status=200,
+        content_type="application/json; charset=utf-8",
+    )
+
+
+def _output_mismatch(fn: Callable, entry: Route, detail: str) -> TypeError:
+    name = getattr(fn, "__qualname__", repr(fn))
+    return TypeError(
+        f"Handler {name} for {entry.method.upper()} {entry.path} returned a value "
+        f"that does not match its declared output={entry.output.__name__}: {detail}"  # type: ignore[union-attr]
+    )
+
+
+def _serialize_result(result: Any, output_model: Optional[type], fn: Callable, entry: Route) -> Any:
+    """Turn a handler's return value into a response.
+
+    A BaseModel instance or dict becomes a JSON response (checked against
+    output_model when set); anything else, e.g. a Response, is returned as-is.
+    A mismatch with output_model is a server bug, so it raises (500) rather
+    than returning a 400.
+    """
+    if isinstance(result, BaseModel):
+        if output_model is not None and not isinstance(result, output_model):
+            raise _output_mismatch(
+                fn, entry, f"got a {type(result).__name__} instance"
+            )
+        return _json_model_response(result)
+    if isinstance(result, dict):
+        if output_model is None:
+            return Response.json(result)
+        try:
+            model = output_model.model_validate(result)  # type: ignore[attr-defined]
+        except ValidationError as exc:
+            raise _output_mismatch(fn, entry, str(exc)) from exc
+        return _json_model_response(model)
+    return result
+
+
 class Router:
     """Minimal router to simplify Datasette plugin route registration and OpenAPI export."""
 
@@ -307,6 +349,13 @@ class Router:
             # append entry after computing schemas
             self._routes.append(entry)
 
+            # Returned dicts/models are only checked against output= when it
+            # is a pydantic model; other classes (tolerated by the OpenAPI
+            # emitter) skip validation.
+            output_model = (
+                output if isinstance(output, type) and issubclass(output, BaseModel) else None
+            )
+
             # Datasette inspects this exact signature to decide what to inject,
             # so it must not change (and must not be masked via __wrapped__).
             async def view(request, datasette=None, scope=None, receive=None, send=None):
@@ -361,7 +410,8 @@ class Router:
                         except ValueError:
                             return _int_parsing_error_response(name)
 
-                return await fn(**kwargs)
+                result = await fn(**kwargs)
+                return _serialize_result(result, output_model, fn, entry)
 
             # Carry the handler's identity for tracing/debugging. Deliberately
             # NOT functools.wraps: that sets __wrapped__, which makes

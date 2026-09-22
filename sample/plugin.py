@@ -22,11 +22,10 @@ class Output(BaseModel):
 async def demo1(params: Annotated[Input, Body()]):
     # params is now properly typed as Input, not Body[Input]
     # Type checkers will understand params.id is int, params.name is str
-    output = Output(
+    return Output(
         id_negative=-1 * params.id,
         name_upper=params.name.upper(),
     )
-    return Response.json(output.model_dump())
 
 
 @router.GET(r"/-/hello/(?P<name>.*)$")
