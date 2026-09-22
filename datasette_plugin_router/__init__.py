@@ -1,11 +1,12 @@
 from __future__ import annotations
 import inspect
 import re
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
+import types
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar, Union, get_args, get_origin, Annotated
 from dataclasses import dataclass
 
 from datasette import Forbidden, Response
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 
 
 @dataclass
@@ -22,6 +23,12 @@ class Route:
     # Datasette action the actor must be allowed (via datasette.allowed())
     # before the handler runs; None means the route is public.
     permission: Optional[str] = None
+    # Private Pydantic model with one field per Query() parameter (field
+    # name = parameter name), or None when the handler has no Query() params.
+    query_model: Optional[type] = None
+    # (parameter name, query-string key, is_list) for each Query() param,
+    # in signature order.
+    query_fields: Optional[List[Tuple[str, str, bool]]] = None
 
 T = TypeVar('T')
 
@@ -62,14 +69,44 @@ class Body:
         """
         return cls(item)
 
+
+class Query:
+    """Marker for query-string parameters.
+
+    Usage:
+      from typing import Annotated, Optional
+
+      async def view(
+          q: Annotated[str, Query()],                      # required
+          limit: Annotated[int, Query()] = 20,             # default
+          tag: Annotated[list[str], Query()] = [],         # ?tag=a&tag=b
+          size: Annotated[int, Query(alias="_size")] = 10, # read from ?_size=
+      ):
+
+    Supported types: str, int, float, bool, Optional[...] of those, and
+    list[...] of str/int/float. The parameter's Python default is the
+    default; a parameter without one is required.
+    """
+
+    def __init__(self, *, alias: Optional[str] = None):
+        self.alias = alias
+
+    def __repr__(self) -> str:
+        if self.alias is not None:
+            return f"Query(alias={self.alias!r})"
+        return "Query()"
+
+
 _SPECIAL_PARAMS = frozenset({"request", "datasette", "scope", "receive", "send"})
 
 
 class _Binding(NamedTuple):
     """One step of a view's precomputed parameter binding plan.
 
-    kind is one of "special", "body", "str_var", "int_var"; model is the
-    Pydantic model class for "body" bindings and None otherwise.
+    kind is one of "special", "body", "str_var", "int_var", "query"; model
+    is the Pydantic model class for "body" and "query" bindings and None
+    otherwise. A single "query" binding (named after the first Query()
+    param) binds every Query() parameter at once.
     """
 
     name: str
@@ -89,6 +126,46 @@ def _body_model_from_annotation(annotation: Any) -> Optional[type]:
         return None
     if isinstance(annotation, Body):
         return annotation.model
+    return None
+
+
+def _query_marker_from_annotation(annotation: Any) -> Tuple[Optional[Query], Any]:
+    """Return (Query marker, inner type) for Annotated[T, Query()], else (None, None)."""
+    if get_origin(annotation) is Annotated:
+        args = get_args(annotation)
+        for metadata in args[1:]:
+            if isinstance(metadata, Query):
+                return metadata, args[0]
+    return None, None
+
+
+def _has_body_marker(annotation: Any) -> bool:
+    if isinstance(annotation, Body):
+        return True
+    if get_origin(annotation) is Annotated:
+        return any(isinstance(m, Body) for m in get_args(annotation)[1:])
+    return False
+
+
+_QUERY_SCALARS = (str, int, float, bool)
+_QUERY_LIST_ITEMS = (str, int, float)
+
+
+def _query_type_is_list(inner: Any) -> Optional[bool]:
+    """For a supported Query() inner type return whether it is a list, else None."""
+    if inner in _QUERY_SCALARS:
+        return False
+    origin = get_origin(inner)
+    if origin in (Union, types.UnionType):
+        members = get_args(inner)
+        non_none = [a for a in members if a is not type(None)]
+        if len(members) == 2 and len(non_none) == 1 and non_none[0] in _QUERY_SCALARS:
+            return False
+        return None
+    if origin is list:
+        args = get_args(inner)
+        if len(args) == 1 and args[0] in _QUERY_LIST_ITEMS:
+            return True
     return None
 
 
@@ -131,9 +208,12 @@ class Router:
             input_model = None
             input_model_found = False
             signature_error: Optional[Exception] = None
-            # (param name, reason) for required params that cannot be bound;
+            # (param name, reason) for required params that cannot be bound
+            # (and for invalid Query() params, with or without a default);
             # raised below, outside the try, so it is never swallowed.
             unbindable: List[Tuple[str, str]] = []
+            # (param name, query key, is_list, inner type, default) per Query() param.
+            query_params: List[Tuple[str, str, bool, Any, Any]] = []
             try:
                 # Resolve string annotations (from __future__ import annotations);
                 # fall back to raw ones if a forward reference can't be evaluated.
@@ -147,6 +227,19 @@ class Router:
                     annotation = pparam.annotation
                     if pname in path_param_names and isinstance(annotation, type):
                         param_types[pname] = annotation
+                    query_marker, query_inner = _query_marker_from_annotation(annotation)
+                    if query_marker is not None:
+                        if _has_body_marker(annotation):
+                            unbindable.append((pname, "is annotated with both Body() and Query()"))
+                            continue
+                        is_list = _query_type_is_list(query_inner)
+                        if is_list is None:
+                            unbindable.append((pname, _unbindable_reason(pname, annotation)))
+                            continue
+                        query_params.append(
+                            (pname, query_marker.alias or pname, is_list, query_inner, pparam.default)
+                        )
+                        continue
                     body_model = _body_model_from_annotation(annotation)
                     # The first Body parameter drives the OpenAPI requestBody
                     # (a bare legacy Body() annotation also ends the search).
@@ -173,6 +266,36 @@ class Router:
                 handler = getattr(fn, "__qualname__", repr(fn))
                 raise ValueError(f"Parameter {pname!r} of handler {handler} for route {path!r} {reason}")
             entry.path_param_types = param_types
+
+            if query_params:
+                fields = {
+                    pname: (inner, ... if default is inspect.Parameter.empty else default)
+                    for pname, _key, _is_list, inner, default in query_params
+                }
+                try:
+                    query_model = create_model(f"{getattr(fn, '__name__', 'handler')}Query", **fields)
+                except Exception as exc:
+                    handler = getattr(fn, "__qualname__", repr(fn))
+                    raise ValueError(
+                        f"Query() parameters of handler {handler} for route {path!r} are invalid: {exc}"
+                    ) from exc
+                # Pydantic turns underscore-prefixed names into private
+                # attributes, which would silently never be bound.
+                for pname, *_rest in query_params:
+                    if pname not in query_model.model_fields:
+                        handler = getattr(fn, "__qualname__", repr(fn))
+                        raise ValueError(
+                            f"Parameter {pname!r} of handler {handler} for route {path!r} cannot be a "
+                            "Query() parameter name (names starting with an underscore are not "
+                            f"supported; use a plain name with Query(alias={pname!r}))"
+                        )
+                entry.query_model = query_model
+                entry.query_fields = [(pname, key, is_list) for pname, key, is_list, _i, _d in query_params]
+                # One step binds every Query() param; it runs before any body
+                # step so a bad query string never reads the request body.
+                query_binding = _Binding(query_params[0][0], "query", query_model)
+                body_index = next((i for i, b in enumerate(plan) if b.kind == "body"), len(plan))
+                plan.insert(body_index, query_binding)
 
             if input_model is not None:
                 entry.input_schema = _model_to_schema(input_model) or {"type": "object"}
@@ -210,6 +333,18 @@ class Router:
                     kind = binding.kind
                     if kind == "special":
                         kwargs[name] = specials[name]
+                    elif kind == "query":
+                        args = request.args
+                        query_data: Dict[str, Any] = {}
+                        for pname, key, is_list in entry.query_fields:  # type: ignore[union-attr]
+                            if key in args:
+                                query_data[pname] = args.getlist(key) if is_list else args.get(key)
+                        try:
+                            query_instance = binding.model.model_validate(query_data)  # type: ignore[union-attr]
+                        except ValidationError as exc:
+                            return _validation_error_response(exc)
+                        for pname, _key, _is_list in entry.query_fields:  # type: ignore[union-attr]
+                            kwargs[pname] = getattr(query_instance, pname)
                     elif kind == "body":
                         data = await request.post_body()
                         try:
@@ -286,6 +421,27 @@ class Router:
                 else:
                     schema_type = "string"
                 parameters.append({"name": name, "in": "path", "required": True, "schema": {"type": schema_type}})
+
+            if entry.query_model is not None and entry.query_fields:
+                query_schema = entry.query_model.model_json_schema()
+                model_fields = entry.query_model.model_fields
+                for pname, key, is_list in entry.query_fields:
+                    prop = dict(query_schema.get("properties", {}).get(pname, {}))
+                    prop.pop("title", None)
+                    if "$ref" in repr(prop):
+                        if "$defs" in query_schema:
+                            prop["$defs"] = query_schema["$defs"]
+                        prop = _extract_defs_from_schema(prop, components_schemas)
+                    param: Dict[str, Any] = {
+                        "name": key,
+                        "in": "query",
+                        "required": model_fields[pname].is_required(),
+                        "schema": prop,
+                    }
+                    if is_list:
+                        param["style"] = "form"
+                        param["explode"] = True
+                    parameters.append(param)
 
             operation: Dict[str, Any] = {"responses": {"200": {"description": "OK"}}, "parameters": parameters}
 
@@ -369,6 +525,12 @@ def _int_parsing_error_response(name: str) -> Response:
 
 def _unbindable_reason(name: str, annotation: Any) -> str:
     """Explain why a required handler parameter cannot be bound (for the ValueError)."""
+    query_marker, query_inner = _query_marker_from_annotation(annotation)
+    if query_marker is not None:
+        return (
+            f"is annotated Query() with unsupported type {query_inner!r} (expected str, int, "
+            "float, bool, Optional[...] of those, or list[...] of str/int/float)"
+        )
     if annotation is str or annotation is int:
         return (
             f"is annotated {annotation.__name__} but {name!r} is not a named group in the route regex"

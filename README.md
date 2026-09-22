@@ -88,6 +88,7 @@ resolved at registration.
 
 - `request`, `datasette`, `scope`, `receive` and `send` get the Datasette values.
 - `Annotated[Model, Body()]` (or legacy `Body[Model]`) gets the validated request body.
+- `Annotated[T, Query()]` gets a typed query-string value (see "Query parameters" below).
 - A `str`- or `int`-annotated parameter gets the URL var of the same name; its
   name must be a named group in the route regex (e.g. `(?P<id>\d+)`).
 - Any other parameter without a default (no annotation, an unsupported type such
@@ -96,6 +97,47 @@ resolved at registration.
   `*args`/`**kwargs`, are left alone.
 - A value that `int()` cannot parse for an `int` parameter gets a **400**
   (`{"error": "id: value is not a valid integer", "errors": [{"type": "int_parsing", ...}]}`).
+
+## Query parameters
+
+Annotate a parameter with `Query()` to bind it from the query string:
+
+```python
+from typing import Annotated, Optional
+from datasette_plugin_router import Router, Query
+
+@router.GET(r"^/-/search$")
+async def search(
+    q: Annotated[str, Query()],                       # required
+    limit: Annotated[int, Query()] = 20,              # optional with default
+    lat: Annotated[Optional[float], Query()] = None,  # optional
+    verbose: Annotated[bool, Query()] = False,
+    tag: Annotated[list[str], Query()] = [],          # multi-value ?tag=a&tag=b
+    size: Annotated[int, Query(alias="_size")] = 10,  # read from ?_size=
+):
+    ...
+```
+
+- Supported types: `str`, `int`, `float`, `bool`, `Optional[...]` of those,
+  and `list[...]` / `List[...]` of `str`, `int` or `float`. Any other type, or
+  a parameter marked with both `Body()` and `Query()`, raises `ValueError` at
+  import time.
+- A parameter without a default is required; the Python default is used when
+  the key is absent from the query string.
+- Scalars use the first value if the key is repeated; `list[...]` parameters
+  collect every value (`?tag=a&tag=b` gives `["a", "b"]`, absent gives the
+  default).
+- `Query(alias="_size")` reads `?_size=` instead of the parameter name.
+- Values are coerced with Pydantic's lax mode, so `bool` accepts Pydantic's
+  usual spellings (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, ...).
+- A missing required value or one that fails coercion gets a **400** in the
+  same shape as request body errors (see "Request body validation errors"
+  below), with `loc` set to the parameter name, e.g.
+  `{"error": "limit: Input should be a valid integer, ...", "errors": [{"type": "int_parsing", "loc": ["limit"], ...}]}`.
+  Query parameters are validated before the request body is read.
+- Query parameters appear in the OpenAPI document as `in: query` parameters
+  (named by their alias, if any) with `required`, a JSON schema `type` and any
+  `default`, after the route's path parameters.
 
 ## Permissions
 
