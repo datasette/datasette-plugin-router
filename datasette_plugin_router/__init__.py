@@ -4,7 +4,7 @@ import re
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar, get_args, get_origin, Annotated
 from dataclasses import dataclass
 
-from datasette import Response
+from datasette import Forbidden, Response
 from pydantic import ValidationError
 
 
@@ -19,6 +19,9 @@ class Route:
     # Map from URL-var name -> annotation type (e.g. str, int). Used by
     # the OpenAPI emitter to type path parameters.
     path_param_types: Optional[Dict[str, type]] = None
+    # Datasette action the actor must be allowed (via datasette.allowed())
+    # before the handler runs; None means the route is public.
+    permission: Optional[str] = None
 
 T = TypeVar('T')
 
@@ -98,17 +101,17 @@ class Router:
         self.version = version
         self.server_url = server_url
 
-    def POST(self, path: str, *, output: Optional[type] = None):
-        return self._add_route("post", path, output=output)
+    def POST(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
+        return self._add_route("post", path, output=output, permission=permission)
 
-    def GET(self, path: str, *, output: Optional[type] = None):
-        return self._add_route("get", path, output=output)
+    def GET(self, path: str, *, output: Optional[type] = None, permission: Optional[str] = None):
+        return self._add_route("get", path, output=output, permission=permission)
 
-    def _add_route(self, method: str, path: str, *, output: Optional[type]):
+    def _add_route(self, method: str, path: str, *, output: Optional[type], permission: Optional[str] = None):
         def decorator(fn: Callable):
             # create route entry and compute/store input/output schemas now so
             # we don't need to keep references to the original function
-            entry = Route(path=path, output=output, method=method, fn=None)
+            entry = Route(path=path, output=output, method=method, fn=None, permission=permission)
             # Walk the handler signature once, at decoration time, producing
             # both the OpenAPI path-param types and the per-request binding
             # plan. The view wrapper below only iterates the plan, so no
@@ -177,6 +180,14 @@ class Router:
             async def view(request, datasette=None, scope=None, receive=None, send=None):
                 if signature_error is not None:
                     raise signature_error
+                # Check before binding so a denied request never reads or
+                # validates the body. Forbidden goes through Datasette's
+                # forbidden() hook, so instance-wide 403 customisation applies.
+                if entry.permission is not None:
+                    if datasette is None:
+                        raise RuntimeError("permission= requires Datasette to inject `datasette`")
+                    if not await datasette.allowed(action=entry.permission, actor=request.actor):
+                        raise Forbidden(f"Permission denied: {entry.permission}")
                 specials = {
                     "request": request,
                     "datasette": datasette,

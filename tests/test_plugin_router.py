@@ -584,3 +584,126 @@ def test_var_args_and_kwargs_do_not_raise():
         return Response.text("ok")
 
     assert len(router.routes()) == 1
+
+
+def _permission_router():
+    class Item(BaseModel):
+        id: int
+
+    router = Router()
+    calls = []
+
+    @router.GET(r"^/-/perm/get$", permission="router-test-access")
+    async def perm_get(request):
+        calls.append(("get", request.actor))
+        return Response.json({"ok": True, "actor": request.actor})
+
+    @router.POST(r"^/-/perm/post$", permission="router-test-access")
+    async def perm_post(item: Annotated[Item, Body()]):
+        calls.append(("post", item.id))
+        return Response.json({"id": item.id})
+
+    @router.GET(r"^/-/perm/public$")
+    async def perm_public():
+        return Response.json({"public": True})
+
+    return router, calls
+
+
+@pytest.fixture
+def permission_datasette():
+    from datasette.permissions import Action
+
+    router, calls = _permission_router()
+    # Grant the registered action to alice only, via datasette.yaml-style config.
+    datasette = Datasette(
+        memory=True,
+        config={"permissions": {"router-test-access": {"id": "alice"}}},
+    )
+
+    class TestPlugin:
+        __name__ = "PermissionTestPlugin"
+
+        @hookimpl
+        def register_routes(datasette):
+            return router.routes()
+
+        @hookimpl
+        def register_actions(datasette):
+            return [Action(name="router-test-access", description="Test router access")]
+
+    datasette.pm.register(TestPlugin(), name="permission-test-plugin")
+    try:
+        yield datasette, router, calls
+    finally:
+        datasette.pm.unregister(name="permission-test-plugin")
+
+
+@pytest.mark.asyncio
+async def test_permission_denies_anonymous(permission_datasette):
+    datasette, _, calls = permission_datasette
+    r = await datasette.client.get("/-/perm/get", headers={"accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["error"] == "Permission denied: router-test-access"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_permission_denies_other_actor(permission_datasette):
+    datasette, _, calls = permission_datasette
+    r = await datasette.client.get("/-/perm/get", actor={"id": "bob"})
+    assert r.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_permission_allows_granted_actor(permission_datasette):
+    datasette, _, calls = permission_datasette
+    r = await datasette.client.get("/-/perm/get", actor={"id": "alice"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "actor": {"id": "alice"}}
+    assert calls == [("get", {"id": "alice"})]
+
+
+@pytest.mark.asyncio
+async def test_permission_checked_before_body_parsing(permission_datasette):
+    datasette, _, calls = permission_datasette
+    r = await datasette.client.post(
+        "/-/perm/post",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 403
+    assert calls == []
+    # An allowed actor sending the same invalid body gets the usual 400.
+    r = await datasette.client.post(
+        "/-/perm/post",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+        actor={"id": "alice"},
+    )
+    assert r.status_code == 400
+    r = await datasette.client.post("/-/perm/post", json={"id": 7}, actor={"id": "alice"})
+    assert r.status_code == 200
+    assert r.json() == {"id": 7}
+
+
+@pytest.mark.asyncio
+async def test_route_without_permission_is_public(permission_datasette):
+    datasette, router, _ = permission_datasette
+    r = await datasette.client.get("/-/perm/public")
+    assert r.status_code == 200
+    assert r.json() == {"public": True}
+    public = [e for e in router._routes if e.path == r"^/-/perm/public$"]
+    assert public[0].permission is None
+
+
+@pytest.mark.asyncio
+async def test_permission_without_datasette_raises():
+    from datasette.utils.asgi import Request
+
+    router, calls = _permission_router()
+    entry = next(e for e in router._routes if e.permission is not None)
+    with pytest.raises(RuntimeError, match="requires Datasette"):
+        await entry.fn(Request.fake("/-/perm/get"), datasette=None)
+    assert calls == []
