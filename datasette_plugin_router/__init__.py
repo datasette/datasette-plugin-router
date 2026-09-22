@@ -2,8 +2,10 @@ from __future__ import annotations
 import inspect
 import re
 import types
+from datetime import date
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar, Union, get_args, get_origin, Annotated
 from dataclasses import dataclass
+from uuid import UUID
 
 from datasette import Forbidden, Response
 from pydantic import BaseModel, ValidationError, create_model
@@ -100,18 +102,44 @@ class Query:
 _SPECIAL_PARAMS = frozenset({"request", "datasette", "scope", "receive", "send"})
 
 
+# Table-driven support for typed (non-str) path parameters. Each entry is
+# (converter, error_type, openapi_schema, message):
+#   - converter(raw_str) -> value, or raises ValueError/TypeError on a bad value.
+#   - error_type is the "type" field of the router's 400 {"errors": [...]} shape.
+#   - openapi_schema is the JSON Schema used for this param in the OpenAPI doc.
+#   - message is the "msg" (and the tail of "error") of the 400 response.
+# `str` is not here: it is the untyped default, handled separately as "str_var".
+# `bool` is deliberately absent (ambiguous in URLs; rejected with a dedicated
+# message in _unbindable_reason) and so is `datetime.datetime`.
+_PATH_PARAM_TYPES: Dict[type, Tuple[Callable[[str], Any], str, Dict[str, str], str]] = {
+    int: (int, "int_parsing", {"type": "integer"}, "value is not a valid integer"),
+    float: (float, "float_parsing", {"type": "number"}, "value is not a valid number"),
+    UUID: (UUID, "uuid_parsing", {"type": "string", "format": "uuid"}, "value is not a valid UUID"),
+    date: (
+        date.fromisoformat,
+        "date_parsing",
+        {"type": "string", "format": "date"},
+        "value is not a valid date (expected YYYY-MM-DD)",
+    ),
+}
+
+
 class _Binding(NamedTuple):
     """One step of a view's precomputed parameter binding plan.
 
-    kind is one of "special", "body", "str_var", "int_var", "query"; model
+    kind is one of "special", "body", "str_var", "typed_var", "query"; model
     is the Pydantic model class for "body" and "query" bindings and None
-    otherwise. A single "query" binding (named after the first Query()
-    param) binds every Query() parameter at once.
+    otherwise. converter is set only for "typed_var" bindings, to the
+    (convert_fn, error_type, message) entry from _PATH_PARAM_TYPES (minus its
+    OpenAPI schema, which is not needed at request time). A single "query"
+    binding (named after the first Query() param) binds every Query()
+    parameter at once.
     """
 
     name: str
     kind: str
     model: Optional[type] = None
+    converter: Optional[Tuple[Callable[[str], Any], str, str]] = None
 
 
 def _body_model_from_annotation(annotation: Any) -> Optional[type]:
@@ -294,8 +322,9 @@ class Router:
                         plan.append(_Binding(pname, "body", body_model))
                     elif annotation is str and pname in path_param_names:
                         plan.append(_Binding(pname, "str_var"))
-                    elif annotation is int and pname in path_param_names:
-                        plan.append(_Binding(pname, "int_var"))
+                    elif annotation in _PATH_PARAM_TYPES and pname in path_param_names:
+                        convert, error_type, _schema, msg = _PATH_PARAM_TYPES[annotation]
+                        plan.append(_Binding(pname, "typed_var", converter=(convert, error_type, msg)))
                     elif pparam.default is inspect.Parameter.empty:
                         unbindable.append((pname, _unbindable_reason(pname, annotation)))
                     # Unbindable params with a default are left to that default.
@@ -403,12 +432,13 @@ class Router:
                         kwargs[name] = model_instance
                     elif kind == "str_var":
                         kwargs[name] = request.url_vars[name]
-                    elif kind == "int_var":
+                    elif kind == "typed_var":
                         # int() accepts "1_0" and " 5 "; that is tolerated.
+                        convert, error_type, msg = binding.converter  # type: ignore[misc]
                         try:
-                            kwargs[name] = int(request.url_vars[name])
-                        except ValueError:
-                            return _int_parsing_error_response(name)
+                            kwargs[name] = convert(request.url_vars[name])
+                        except (ValueError, TypeError):
+                            return _param_parsing_error_response(name, error_type, msg)
 
                 result = await fn(**kwargs)
                 return _serialize_result(result, output_model, fn, entry)
@@ -468,13 +498,11 @@ class Router:
             param_types = entry.path_param_types or {}
             for name in _extract_named_groups(path):
                 ann = param_types.get(name, str)
-                # bool is an int subclass; we don't support bool path params,
-                # so fall back to "string" for anything we don't recognize.
-                if ann is int:
-                    schema_type = "integer"
-                else:
-                    schema_type = "string"
-                parameters.append({"name": name, "in": "path", "required": True, "schema": {"type": schema_type}})
+                # Anything not in the table (including plain str, and anything
+                # we don't recognize) falls back to a bare string schema.
+                table_entry = _PATH_PARAM_TYPES.get(ann)
+                schema = dict(table_entry[2]) if table_entry else {"type": "string"}
+                parameters.append({"name": name, "in": "path", "required": True, "schema": schema})
 
             if entry.query_model is not None and entry.query_fields:
                 query_schema = entry.query_model.model_json_schema()
@@ -511,12 +539,13 @@ class Router:
                 processed_schema = _extract_defs_from_schema(entry.output_schema, components_schemas, where)
                 operation["responses"]["200"]["content"] = {"application/json": {"schema": processed_schema}}
 
-            # The router answers bad bodies, query strings and int url vars
-            # with a 400 {"error", "errors"}; permission denials with a 403.
+            # The router answers bad bodies, query strings and typed url vars
+            # (any path param whose schema is not a bare string) with a 400
+            # {"error", "errors"}; permission denials with a 403.
             can_400 = (
                 entry.input_schema is not None
                 or any(p["in"] == "query" for p in parameters)
-                or any(p["in"] == "path" and p["schema"]["type"] == "integer" for p in parameters)
+                or any(p["in"] == "path" and p["schema"] != {"type": "string"} for p in parameters)
             )
             if can_400:
                 uses_validation_error = True
@@ -633,11 +662,10 @@ def _validation_error_response(exc: ValidationError) -> Response:
     return Response.json({"error": message, "errors": errors}, status=400)
 
 
-def _int_parsing_error_response(name: str) -> Response:
-    """400 in the same shape as _validation_error_response, for a bad int url var."""
-    msg = "value is not a valid integer"
+def _param_parsing_error_response(name: str, error_type: str, msg: str) -> Response:
+    """400 in the same shape as _validation_error_response, for a bad typed url var."""
     return Response.json(
-        {"error": f"{name}: {msg}", "errors": [{"type": "int_parsing", "loc": [name], "msg": msg}]},
+        {"error": f"{name}: {msg}", "errors": [{"type": error_type, "loc": [name], "msg": msg}]},
         status=400,
     )
 
@@ -650,20 +678,22 @@ def _unbindable_reason(name: str, annotation: Any) -> str:
             f"is annotated Query() with unsupported type {query_inner!r} (expected str, int, "
             "float, bool, Optional[...] of those, or list[...] of str/int/float)"
         )
-    if annotation is str or annotation is int:
+    if annotation is str or annotation in _PATH_PARAM_TYPES:
+        type_name = getattr(annotation, "__name__", repr(annotation))
         return (
-            f"is annotated {annotation.__name__} but {name!r} is not a named group in the route regex"
+            f"is annotated {type_name} but {name!r} is not a named group in the route regex"
         )
     if isinstance(annotation, Body):
         return "is annotated with a bare Body() that has no model to validate against"
     if annotation is bool:
         return (
             "is annotated bool, which the router cannot bind (bool url vars are not supported; "
-            "expected str/int url var, Body(), or request/datasette/scope/receive/send)"
+            "expected str/int/float/uuid.UUID/datetime.date url var, Body(), or "
+            "request/datasette/scope/receive/send)"
         )
     return (
-        "has no annotation the router can bind (expected str/int url var, Body(), "
-        "or request/datasette/scope/receive/send)"
+        "has no annotation the router can bind (expected str/int/float/uuid.UUID/datetime.date "
+        "url var, Body(), or request/datasette/scope/receive/send)"
     )
 
 

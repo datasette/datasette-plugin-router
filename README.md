@@ -88,13 +88,17 @@ resolved at registration.
 - `request`, `datasette`, `scope`, `receive` and `send` get the Datasette values.
 - `Annotated[Model, Body()]` (or legacy `Body[Model]`) gets the validated request body.
 - `Annotated[T, Query()]` gets a typed query-string value (see "Query parameters" below).
-- A `str`- or `int`-annotated parameter gets the URL var of the same name; its
-  name must be a named group in the route regex (e.g. `(?P<id>\d+)`).
+- A parameter annotated `str`, `int`, `float`, `uuid.UUID` or `datetime.date`
+  gets the URL var of the same name, converted to that type; its name must be
+  a named group in the route regex (e.g. `(?P<id>\d+)`). A `date` is parsed
+  with `date.fromisoformat`, i.e. `YYYY-MM-DD`.
 - Any other parameter without a default (no annotation, an unsupported type such
-  as `bool`, or a `str`/`int` name missing from the regex) raises `ValueError` at
+  as `bool`, or a name missing from the regex) raises `ValueError` at
   import time, naming the parameter and route. Parameters with defaults, and
   `*args`/`**kwargs`, are left alone.
-- A value that `int()` cannot parse for an `int` parameter gets a **400**
+- A value that fails to convert for a typed path parameter gets a **400** in
+  the same `{"error", "errors"}` shape, with an `errors[0]["type"]` of
+  `int_parsing`, `float_parsing`, `uuid_parsing` or `date_parsing`
   (`{"error": "id: value is not a valid integer", "errors": [{"type": "int_parsing", ...}]}`).
 
 ## Query parameters
